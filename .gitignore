@@ -1,0 +1,37 @@
+# Data (too large for GitHub)
+data/raw/
+data/processed/
+
+# Model checkpoints (too large for GitHub)
+checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.egg-info/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+wandb/
+runs/
+*.log
+
+# Guide (personal reference, not part of the codebase)
+MedJEPA_Complete_Guide.md
+
+# Test setup file
+test_setup.py
