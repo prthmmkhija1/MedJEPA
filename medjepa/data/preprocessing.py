@@ -138,3 +138,52 @@ class MedicalImagePreprocessor:
         """
         image = self.preprocess(path)  # (H, W, 3) numpy
         return torch.from_numpy(image).permute(2, 0, 1)  # (3, H, W) tensor
+
+
+class VolumetricPreprocessor:
+    """
+    Preprocessor for 3D medical data (CT scans, MRI volumes).
+
+    A CT scan is like a stack of 2D X-ray slices.
+    Imagine slicing a loaf of bread — each slice is a 2D image,
+    and the full loaf is a 3D volume.
+    """
+
+    def __init__(
+        self,
+        target_size: Tuple[int, int, int] = (128, 128, 64),
+        # width=128, height=128, depth=64 slices
+    ):
+        self.target_size = target_size
+
+    def load_nifti_volume(self, path: str) -> np.ndarray:
+        """Load a full 3D volume from a NIfTI file."""
+        import nibabel as nib
+        nii = nib.load(path)
+        volume = nii.get_fdata().astype(np.float32)
+        return volume
+
+    def normalize_volume(self, volume: np.ndarray) -> np.ndarray:
+        """Normalize the entire 3D volume to 0-1 range."""
+        v_min, v_max = volume.min(), volume.max()
+        if v_max - v_min == 0:
+            return np.zeros_like(volume)
+        return (volume - v_min) / (v_max - v_min)
+
+    def resize_volume(self, volume: np.ndarray) -> np.ndarray:
+        """Resize 3D volume to target size using simple interpolation."""
+        from scipy.ndimage import zoom
+
+        current_shape = volume.shape
+        zoom_factors = [
+            t / c for t, c in zip(self.target_size, current_shape[:3])
+        ]
+        resized = zoom(volume, zoom_factors, order=1)  # Linear interpolation
+        return resized
+
+    def preprocess(self, path: str) -> np.ndarray:
+        """Full 3D preprocessing pipeline."""
+        volume = self.load_nifti_volume(path)
+        volume = self.normalize_volume(volume)
+        volume = self.resize_volume(volume)
+        return volume

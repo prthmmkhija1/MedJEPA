@@ -1,0 +1,53 @@
+# ===================================================
+# MedJEPA Base Configuration
+# ===================================================
+# This file contains ALL settings for an experiment.
+# Override specific values in modality-specific configs.
+
+# --- Model Architecture ---
+model:
+  type: "lejepa" # "lejepa" for 2D, "vjepa" for 3D
+  image_size: 224
+  patch_size: 16
+  in_channels: 3
+  embed_dim: 768
+  encoder_depth: 12
+  encoder_heads: 12
+  predictor_dim: 384
+  predictor_depth: 6
+  predictor_heads: 6
+
+# --- Masking ---
+masking:
+  mask_ratio: 0.75 # Hide 75% of patches
+  mask_type: "block" # "block" or "random"
+  num_target_blocks: 4
+
+# --- Training ---
+training:
+  batch_size: 64 # How many images per step
+  num_epochs: 100 # How many times to go through the full dataset
+  learning_rate: 0.001
+  weight_decay: 0.05 # Prevents overfitting
+  warmup_epochs: 10 # Slowly increase learning rate at start
+  lambda_reg: 1.0 # SIGReg regularization strength
+
+# --- Data ---
+data:
+  dataset: "ham10000"
+  data_dir: "data/raw/ham10000"
+  target_size: 224
+  num_workers: 4 # Parallel data loading threads
+
+# --- Hardware ---
+hardware:
+  device: "auto" # "auto", "cuda", "mps", or "cpu"
+  mixed_precision: true # Use float16 to save memory (GPU only)
+
+# --- Logging ---
+logging:
+  log_every: 50 # Print progress every N steps
+  save_every: 5 # Save model every N epochs
+  checkpoint_dir: "checkpoints"
+  use_wandb: false # Set true to log to wandb.ai
+  project_name: "MedJEPA"

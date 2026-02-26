@@ -1,37 +1,70 @@
-# Data (too large for GitHub)
+# ===================================================
+# MedJEPA .gitignore
+# ===================================================
+
+# --- Data (too large for GitHub) ---
 data/raw/
 data/processed/
+data/external/
+*.tar
+*.tar.gz
+*.zip
+*.h5
+*.hdf5
+*.nii
+*.nii.gz
+*.dcm
 
-# Model checkpoints (too large for GitHub)
+# --- Model checkpoints (too large for GitHub) ---
 checkpoints/
+*.pt
+*.pth
+*.onnx
 
-# Python
+# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
 venv/
-.egg-info/
+env/
+.env/
+.venv/
 *.egg-info/
+*.egg
 dist/
 build/
+.eggs/
 
-# Jupyter
+# --- Jupyter ---
 .ipynb_checkpoints/
 
-# OS files
+# --- OS files ---
 .DS_Store
 Thumbs.db
+Desktop.ini
+ehthumbs.db
 
-# IDE
+# --- IDE ---
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# Logs
+# --- Experiment tracking & logs ---
 wandb/
 runs/
 *.log
+lightning_logs/
 
-# Guide (personal reference, not part of the codebase)
+# --- Test / CI ---
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+
+# --- Guide (personal reference, not part of the codebase) ---
+GUIDE.md
 MedJEPA_Complete_Guide.md
-
-# Test setup file
-test_setup.py
