@@ -135,8 +135,11 @@ class MedJEPATrainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
-            total_loss += loss.item()
-            num_batches += 1
+            # Skip inf/nan batches in accumulation (numerical stability)
+            loss_val = loss.item()
+            if not (loss_val != loss_val or loss_val == float('inf')):
+                total_loss += loss_val
+                num_batches += 1
 
             # Print progress
             log_every = self.config.get("log_every", 50)

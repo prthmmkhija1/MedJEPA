@@ -77,13 +77,17 @@ class SIGRegLoss(nn.Module):
         # Reshape: combine batch and token dimensions
         flat = embeddings.reshape(-1, embed_dim)
 
+        # Force float32 for numerical stability (float16 overflows at ~65504
+        # and the covariance matrix multiply easily exceeds that with large embed_dim)
+        flat = flat.float()
+
         # Center the embeddings (subtract mean)
         flat = flat - flat.mean(dim=0, keepdim=True)
 
         # Compute covariance matrix
         # (what correlations exist between embedding dimensions?)
         n = flat.shape[0]
-        cov = (flat.T @ flat) / (n - 1)
+        cov = (flat.T @ flat) / max(n - 1, 1)
 
         # We want cov to be close to the identity matrix
         # Loss = how far is cov from identity?
@@ -113,6 +117,10 @@ class SIGRegLoss(nn.Module):
         reg_loss = self.regularization_loss(all_embeddings)
 
         total_loss = pred_loss + self.lambda_reg * reg_loss
+
+        # Clamp to prevent inf/nan from propagating and crashing training
+        if not torch.isfinite(total_loss):
+            total_loss = pred_loss.clamp(max=10.0) + self.lambda_reg * reg_loss.clamp(max=10.0)
 
         return {
             "total_loss": total_loss,
