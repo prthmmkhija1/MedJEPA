@@ -42,9 +42,13 @@ def main():
     parser.add_argument("--predictor_depth", type=int, default=None,
                         help="Override predictor_depth (use if checkpoint config lacks it)")
     parser.add_argument("--file_extension", type=str, default=".jpg")
+    parser.add_argument("--image_column", type=str, default="image_id",
+                        help="CSV column containing image file names/IDs")
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader workers (0 for Windows/HP-Lite, 4+ for Linux/GPU)")
+    parser.add_argument("--output", type=str, default="results/evaluation_results.json",
+                        help="Path to save evaluation results JSON")
     args = parser.parse_args()
 
     device = get_device()
@@ -74,6 +78,7 @@ def main():
     dataset = MedicalImageDataset(
         image_dir=args.data_dir,
         metadata_csv=args.metadata_csv,
+        image_column=args.image_column,
         label_column=args.label_column,
         file_extension=args.file_extension,
         target_size=(args.image_size, args.image_size),
@@ -145,8 +150,8 @@ def main():
         "few_shot": results_fs,
     }
 
-    output_path = Path("results") / "evaluation_results.json"
-    output_path.parent.mkdir(exist_ok=True)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
 
