@@ -17,6 +17,10 @@ import time
 import json
 from typing import Optional
 from medjepa.utils.device import get_device
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 
 class MedJEPATrainer:
@@ -102,7 +106,17 @@ class MedJEPATrainer:
         num_batches = 0
         start_time = time.time()
 
-        for batch_idx, batch in enumerate(self.train_loader):
+        loader = self.train_loader
+        if tqdm is not None:
+            loader = tqdm(
+                self.train_loader,
+                desc=f"Epoch {epoch+1}/{self.config.get('num_epochs',100)}",
+                unit="batch",
+                leave=True,
+                dynamic_ncols=True,
+            )
+
+        for batch_idx, batch in enumerate(loader):
             # Handle both (images,) and (images, labels) formats
             if isinstance(batch, (list, tuple)):
                 images = batch[0]
@@ -141,19 +155,26 @@ class MedJEPATrainer:
                 total_loss += loss_val
                 num_batches += 1
 
-            # Print progress
-            log_every = self.config.get("log_every", 50)
-            if (batch_idx + 1) % log_every == 0:
-                elapsed = time.time() - start_time
-                avg_loss = total_loss / num_batches
-                print(
-                    f"  Epoch {epoch+1} | "
-                    f"Batch {batch_idx+1}/{len(self.train_loader)} | "
-                    f"Loss: {avg_loss:.4f} | "
-                    f"Pred Loss: {losses['prediction_loss'].item():.4f} | "
-                    f"Reg Loss: {losses['regularization_loss'].item():.4f} | "
-                    f"Time: {elapsed:.1f}s"
+            # Update tqdm postfix or print progress
+            avg_loss = total_loss / max(num_batches, 1)
+            if tqdm is not None and hasattr(loader, 'set_postfix'):
+                loader.set_postfix(
+                    loss=f"{avg_loss:.4f}",
+                    pred=f"{losses['prediction_loss'].item():.4f}",
+                    reg=f"{losses['regularization_loss'].item():.4f}",
                 )
+            else:
+                log_every = self.config.get("log_every", 50)
+                if (batch_idx + 1) % log_every == 0:
+                    elapsed = time.time() - start_time
+                    print(
+                        f"  Epoch {epoch+1} | "
+                        f"Batch {batch_idx+1}/{len(self.train_loader)} | "
+                        f"Loss: {avg_loss:.4f} | "
+                        f"Pred Loss: {losses['prediction_loss'].item():.4f} | "
+                        f"Reg Loss: {losses['regularization_loss'].item():.4f} | "
+                        f"Time: {elapsed:.1f}s"
+                    )
 
         # Step the learning rate scheduler
         self.scheduler.step()
