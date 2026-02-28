@@ -204,11 +204,6 @@ def parse_args():
     p.add_argument("--no_split_encoding", action="store_true",
                    help="Disable split encoding (run full encoder, slower)")
     p.add_argument("--gradient_checkpointing", action="store_true",
-                   help="Enable gradient checkpointing (saves memory, ~33%% slower)") 
-    # Performance optimizations
-    p.add_argument("--no_split_encoding", action="store_true",
-                   help="Disable split encoding (encode all patches together, slower)")
-    p.add_argument("--gradient_checkpointing", action="store_true",
                    help="Trade ~33%% extra compute for ~2x memory savings (allows bigger batch)")
     p.add_argument("--no_prefetcher", action="store_true",
                    help="Disable CUDA stream prefetcher")
