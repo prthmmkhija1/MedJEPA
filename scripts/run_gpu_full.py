@@ -20,8 +20,8 @@ Usage (from the MedJEPA root directory):
 
 Optional flags:
   --epochs 100          (default: 100)
-  --batch_size 64       (default: 64)
-  --lr 0.001            (default: 0.001)
+  --batch_size 256      (default: 256, A100-40GB tuned)
+  --lr 0.0028           (default: 2.8e-3, linearly scaled for bs=256)
   --embed_dim 768       (default: 768)
   --encoder_depth 12    (default: 12)
   --predictor_depth 6   (default: 6)
@@ -238,7 +238,7 @@ def parse_args():
         "encoder_depth": 12, "predictor_depth": 6, "mask_ratio": 0.75,
         "lambda_reg": 1.0, "volume_size": [128, 128, 64],
         "vjepa_epochs": 50, "vjepa_batch_size": 4,
-        "epochs": 100, "batch_size": 128, "lr": 1.4e-3,
+        "epochs": 100, "batch_size": 256, "lr": 2.8e-3,
         "warmup_epochs": 10, "num_workers": 8,
         "checkpoint_dir": "checkpoints", "results_dir": "results",
         "log_every": 10, "save_every": 5,
@@ -1469,14 +1469,15 @@ def main():
     args = parse_args()
     start = time.time()
 
-    # Reproducibility
+    # Reproducibility — seeds only; leave cuDNN benchmark=True (set in trainer)
     seed = 42
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        # TF32 global setting: "high" enables TF32 matmuls for maximum A100 throughput
+        # (10-bit mantissa vs float32 23-bit — negligible error for self-supervised SSL)
+        torch.set_float32_matmul_precision("high")
 
     banner("MedJEPA -- Full GPU Pipeline (6 Datasets)")
     get_device_info()
