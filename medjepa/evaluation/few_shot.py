@@ -91,17 +91,21 @@ class FewShotEvaluator:
             fractions: What percentage of labels to use (0.01 = 1%, 0.5 = 50%)
         """
         results = []
+        rng = np.random.RandomState(42)  # Fixed seed for reproducibility
 
         for frac in fractions:
             n = max(1, int(len(full_train_labels) * frac))
-            indices = np.random.choice(len(full_train_labels), n, replace=False)
+            indices = rng.choice(len(full_train_labels), n, replace=False)
 
             subset_features = full_train_features[indices].numpy()
             subset_labels = full_train_labels[indices].numpy()
 
-            knn = KNeighborsClassifier(
-                n_neighbors=min(self.k, len(subset_labels))
-            )
+            # Ensure k doesn't exceed number of unique samples
+            n_neighbors = min(self.k, len(subset_labels))
+            # kNN needs at least 1 neighbor
+            n_neighbors = max(1, n_neighbors)
+
+            knn = KNeighborsClassifier(n_neighbors=n_neighbors)
             knn.fit(subset_features, subset_labels)
             predictions = knn.predict(test_features.numpy())
             accuracy = accuracy_score(test_labels.numpy(), predictions)

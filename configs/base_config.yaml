@@ -32,6 +32,13 @@ training:
   warmup_epochs: 10 # Slowly increase learning rate at start
   lambda_reg: 1.0 # SIGReg regularization strength
 
+# --- V-JEPA (3D Volumes) ---
+vjepa:
+  epochs: 50 # V-JEPA pre-training epochs
+  batch_size: 4 # 3D volumes are memory-intensive
+  volume_size: [128, 128, 64] # Target volume dimensions (D, H, W)
+  patch_size_3d: [16, 16, 8] # 3D patch dimensions
+
 # --- Data ---
 data:
   dataset: "ham10000"
@@ -46,8 +53,10 @@ hardware:
 
 # --- Logging ---
 logging:
-  log_every: 50 # Print progress every N steps
+  log_every: 10 # Print progress every N steps
   save_every: 5 # Save model every N epochs
   checkpoint_dir: "checkpoints"
+  results_dir: "results" # Where evaluation results are saved
   use_wandb: false # Set true to log to wandb.ai
+  use_tensorboard: true # TensorBoard logging (runs/ directory)
   project_name: "MedJEPA"

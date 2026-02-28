@@ -9,17 +9,25 @@ Auto-detect the best available device across all your machines.
 import torch
 
 
-def get_device():
+_device_printed = False
+
+
+def get_device(verbose: bool = False):
     """Automatically pick the best device available."""
+    global _device_printed
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        print(f"Using NVIDIA GPU: {torch.cuda.get_device_name(0)}")
+        if not _device_printed or verbose:
+            print(f"Using NVIDIA GPU: {torch.cuda.get_device_name(0)}")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
-        print("Using Apple MPS (Metal Performance Shaders)")
+        if not _device_printed or verbose:
+            print("Using Apple MPS (Metal Performance Shaders)")
     else:
         device = torch.device("cpu")
-        print("Using CPU (no GPU detected)")
+        if not _device_printed or verbose:
+            print("Using CPU (no GPU detected)")
+    _device_printed = True
     return device
 
 

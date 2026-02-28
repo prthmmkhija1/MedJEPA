@@ -11,16 +11,21 @@ This is like a gym workout routine:
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from pathlib import Path
 import time
 import json
+import numpy as np
 from typing import Optional
 from medjepa.utils.device import get_device
 try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 
 class MedJEPATrainer:
@@ -47,13 +52,17 @@ class MedJEPATrainer:
         self.device = get_device()
         self.model = self.model.to(self.device)
 
+        # Build sampler: use WeightedRandomSampler when labels exist
+        # and classes are imbalanced (which is common in medical imaging)
+        sampler = self._build_sampler(train_dataset, config)
+
         # DataLoader: feeds batches of images to the model
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.get("batch_size", 32),
-            shuffle=True,       # Random order each epoch
+            shuffle=(sampler is None),  # shuffle only when no sampler
+            sampler=sampler,
             num_workers=config.get("num_workers", 0),
-            # Use 0 workers on HP-Lite (Windows), 4 on Linux/Mac
             pin_memory=torch.cuda.is_available(),
             drop_last=True,     # Drop incomplete last batch
         )
@@ -78,11 +87,28 @@ class MedJEPATrainer:
         )
 
         # Learning rate scheduler:
-        # Cosine annealing = start with high lr, gradually decrease
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        # Cosine annealing *with linear warmup*.
+        # Warmup ramps the LR up from ~0 to peak over the first N epochs,
+        # then cosine-decays for the rest.  This stabilises early training.
+        self.warmup_epochs = config.get("warmup_epochs", 10)
+        num_epochs = config.get("num_epochs", 100)
+        cosine_epochs = max(num_epochs - self.warmup_epochs, 1)
+
+        self.cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_max=config.get("num_epochs", 100),
+            T_max=cosine_epochs,
             eta_min=1e-6,
+        )
+        self.warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=1e-4,
+            end_factor=1.0,
+            total_iters=max(self.warmup_epochs, 1),
+        )
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.optimizer,
+            schedulers=[self.warmup_scheduler, self.cosine_scheduler],
+            milestones=[self.warmup_epochs],
         )
 
         # Mixed precision training (saves GPU memory)
@@ -93,6 +119,61 @@ class MedJEPATrainer:
         self.checkpoint_dir = Path(config.get("checkpoint_dir", "checkpoints"))
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.history = {"train_loss": [], "val_loss": [], "epochs": []}
+
+        # TensorBoard logging (optional)
+        self.tb_writer = None
+        if config.get("use_tensorboard", True) and SummaryWriter is not None:
+            log_dir = Path(config.get("tensorboard_dir", "runs")) / "medjepa"
+            self.tb_writer = SummaryWriter(log_dir=str(log_dir))
+            print(f"  TensorBoard logging -> {log_dir}")
+
+        self._global_step = 0
+
+    # ------------------------------------------------------------------
+    # WeightedRandomSampler: handles class-imbalanced medical datasets
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_sampler(dataset, config):
+        """Build a WeightedRandomSampler if the dataset has labels and
+        ``use_weighted_sampler`` is not explicitly disabled."""
+        if not config.get("use_weighted_sampler", True):
+            return None
+
+        # Try to obtain integer labels from the dataset (or its inner dataset)
+        labels = None
+        for obj in (dataset, getattr(dataset, "dataset", None)):
+            if obj is None:
+                continue
+            if hasattr(obj, "labels") and obj.labels is not None:
+                raw = obj.labels
+                # Only 1-D integer labels work with the sampler
+                arr = np.asarray(raw)
+                if arr.ndim == 1 and np.issubdtype(arr.dtype, np.integer):
+                    labels = arr
+                    break
+                # float labels with integer values (common in CSV-loaded data)
+                if arr.ndim == 1 and np.issubdtype(arr.dtype, np.floating):
+                    if np.all(arr == arr.astype(int)):
+                        labels = arr.astype(int)
+                        break
+
+        if labels is None:
+            return None  # unlabelled / multi-label → just shuffle
+
+        # Compute inverse-frequency sample weights
+        classes, counts = np.unique(labels, return_counts=True)
+        class_weight = {c: 1.0 / cnt for c, cnt in zip(classes, counts)}
+        sample_weights = np.array([class_weight[int(l)] for l in labels],
+                                  dtype=np.float64)
+
+        sampler = WeightedRandomSampler(
+            weights=torch.from_numpy(sample_weights),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        print(f"  WeightedRandomSampler enabled ({len(classes)} classes, "
+              f"min count={int(counts.min())}, max count={int(counts.max())})")
+        return sampler
 
     def train_one_epoch(self, epoch: int) -> float:
         """
@@ -155,6 +236,19 @@ class MedJEPATrainer:
                 total_loss += loss_val
                 num_batches += 1
 
+            self._global_step += 1
+
+            # TensorBoard per-step logging
+            if self.tb_writer is not None and num_batches > 0:
+                self.tb_writer.add_scalar(
+                    "train/loss_step", loss_val, self._global_step)
+                self.tb_writer.add_scalar(
+                    "train/pred_loss_step",
+                    losses["prediction_loss"].item(), self._global_step)
+                self.tb_writer.add_scalar(
+                    "train/reg_loss_step",
+                    losses["regularization_loss"].item(), self._global_step)
+
             # Update tqdm postfix or print progress
             avg_loss = total_loss / max(num_batches, 1)
             if tqdm is not None and hasattr(loader, 'set_postfix'):
@@ -209,6 +303,12 @@ class MedJEPATrainer:
             epoch_time = time.time() - epoch_start
             lr = self.optimizer.param_groups[0]["lr"]
 
+            # TensorBoard epoch-level logging
+            if self.tb_writer is not None:
+                self.tb_writer.add_scalar("train/loss_epoch", train_loss, epoch)
+                self.tb_writer.add_scalar("train/lr", lr, epoch)
+                self.tb_writer.add_scalar("train/epoch_time_s", epoch_time, epoch)
+
             print(
                 f"\nEpoch {epoch+1}/{num_epochs} completed | "
                 f"Train Loss: {train_loss:.4f} | "
@@ -228,6 +328,9 @@ class MedJEPATrainer:
         print("=" * 60)
         print(f"Training complete! Best loss: {best_loss:.4f}")
         print("=" * 60)
+
+        if self.tb_writer is not None:
+            self.tb_writer.close()
 
         return self.history
 
