@@ -342,8 +342,9 @@ def run_lejepa_pretraining(args):
 
     datasets = []
     dataset_sizes = {}
+    dataset_sources = {}  # maps dataset name -> source group for balancing
 
-    # Load 2D datasets (unlabeled)
+    # Load 2D datasets (unlabeled) — each is its own source
     for name, cfg in DATASETS_2D.items():
         if not check_dataset_exists(cfg):
             print(f"  SKIP {name}: data not found at {cfg['data_dir']}")
@@ -353,6 +354,7 @@ def run_lejepa_pretraining(args):
                                  with_labels=False, max_samples=args.max_samples)
             datasets.append(ds)
             dataset_sizes[name] = len(ds)
+            dataset_sources[name] = name  # own source
         except Exception as e:
             print(f"  SKIP {name}: {e}")
 
@@ -366,6 +368,8 @@ def run_lejepa_pretraining(args):
                                        with_labels=False, max_samples=args.max_samples)
             datasets.append(ds)
             dataset_sizes[name] = len(ds)
+            # Group all Decathlon sub-tasks under one "decathlon" source
+            dataset_sources[name] = "decathlon" if name.startswith("decathlon_") else name
         except Exception as e:
             print(f"  SKIP {name}: {e}")
 
@@ -379,23 +383,47 @@ def run_lejepa_pretraining(args):
         pct = 100 * size / len(combined)
         print(f"  {name:25s}: {size:>7d} ({pct:5.1f}%)")
 
-    # Build balanced per-dataset sampler so every dataset gets equal
-    # representation regardless of size (PCam has 327k, APTOS only 3.6k)
-    print("\nBuilding balanced dataset sampler (equal weight per dataset)...")
-    num_datasets = len(datasets)
+    # --------------- Hierarchical 2-level balanced sampler ---------------
+    # Level 1: Each SOURCE (ham, aptos, pcam, chestxray14, brats, decathlon)
+    #          gets equal total weight = 1 / num_sources.
+    # Level 2: Within a multi-task source (decathlon), each sub-task gets
+    #          equal share of that source's weight.
+    # Result: No source dominates, no sub-task dominates within a source.
+    # -------------------------------------------------------------------
+    print("\nBuilding hierarchical balanced sampler (equal weight per source)...")
+    names_list = list(dataset_sizes.keys())
+    unique_sources = sorted(set(dataset_sources.values()))
+    num_sources = len(unique_sources)
+
+    # Count how many sub-datasets belong to each source
+    source_member_count = {}
+    for src in unique_sources:
+        source_member_count[src] = sum(
+            1 for n in names_list if dataset_sources[n] == src
+        )
+
+    print(f"  Sources ({num_sources}): {', '.join(unique_sources)}")
+    for src in unique_sources:
+        members = [n for n in names_list if dataset_sources[n] == src]
+        print(f"    {src}: {len(members)} sub-dataset(s) — {members}")
+
     sample_weights = []
-    for ds in datasets:
+    for i, ds in enumerate(datasets):
+        name = names_list[i]
+        src = dataset_sources[name]
         ds_size = len(ds)
-        # Each sample in this dataset gets weight = 1 / (num_datasets * ds_size)
-        # so the total weight across all datasets is equal
-        w = 1.0 / (num_datasets * ds_size)
+        n_members = source_member_count[src]
+        # w = (1/num_sources) * (1/n_members_in_source) * (1/ds_size)
+        # → every source equal, every sub-task within that source equal
+        w = 1.0 / (num_sources * n_members * ds_size)
         sample_weights.extend([w] * ds_size)
+
     balanced_sampler = torch.utils.data.WeightedRandomSampler(
         weights=torch.tensor(sample_weights, dtype=torch.float64),
         num_samples=len(combined),
         replacement=True,
     )
-    print(f"  Balanced sampler ready — {num_datasets} datasets, {len(combined)} total samples")
+    print(f"  Balanced sampler ready — {num_sources} sources, {len(combined)} total samples")
 
     # Build LeJEPA model
     model = LeJEPA(
@@ -456,21 +484,25 @@ def run_vjepa_pretraining(args):
     banner("PHASE 2: V-JEPA Self-Supervised Pre-Training (3D Volumes)")
 
     volume_size = tuple(args.volume_size)
-    nifti_paths = []
 
-    # Collect all 3D NIfTI volume paths
+    # ── Collect 3D NIfTI paths, tracking source for balanced sampling ──
+    source_paths = {}  # source_name -> [path, ...]
+
     # BraTS
     brats_dir = Path("data/raw/brats")
+    brats_list = []
     if brats_dir.exists():
         for sdir in sorted(brats_dir.iterdir()):
             if sdir.is_dir() and sdir.name.startswith("BraTS"):
                 flair = sdir / f"{sdir.name}_flair.nii.gz"
                 if flair.exists():
-                    nifti_paths.append(str(flair))
-        print(f"  BraTS: {len(nifti_paths)} volumes")
+                    brats_list.append(str(flair))
+    if brats_list:
+        source_paths["brats"] = brats_list
+        print(f"  BraTS: {len(brats_list)} volumes")
 
-    # Decathlon
-    decathlon_count = 0
+    # Decathlon — each task is a sub-entry under one "decathlon" source
+    decathlon_task_paths = {}  # task_name -> [path, ...]
     if DECATHLON_BASE.exists():
         for task_dir in sorted(DECATHLON_BASE.glob("Task*")):
             meta_path = task_dir / "dataset.json"
@@ -478,29 +510,63 @@ def run_vjepa_pretraining(args):
                 import json as json_mod
                 with open(meta_path) as f:
                     meta = json_mod.load(f)
+                task_list = []
                 for entry in meta.get("training", []):
                     img_path = task_dir / entry["image"].lstrip("./")
                     if img_path.exists():
-                        nifti_paths.append(str(img_path))
-                        decathlon_count += 1
-        print(f"  Decathlon: {decathlon_count} volumes")
+                        task_list.append(str(img_path))
+                if task_list:
+                    decathlon_task_paths[task_dir.name] = task_list
+                    print(f"  Decathlon/{task_dir.name}: {len(task_list)} volumes")
 
-    if not nifti_paths:
+    # Flatten all paths + build per-sample source weights
+    nifti_paths = []
+    sample_source_weights = []
+    num_sources = (1 if source_paths.get("brats") else 0) + (1 if decathlon_task_paths else 0)
+
+    if num_sources == 0:
         print("No 3D volumes found. Skipping V-JEPA pre-training.")
         return None
+
+    # BraTS volumes
+    if "brats" in source_paths:
+        brats = source_paths["brats"]
+        # weight = 1/num_sources * 1/len(brats)  (BraTS is one source)
+        w = 1.0 / (num_sources * len(brats))
+        for p in brats:
+            nifti_paths.append(p)
+            sample_source_weights.append(w)
+
+    # Decathlon volumes — hierarchical: source share / num_tasks / task_size
+    if decathlon_task_paths:
+        n_tasks = len(decathlon_task_paths)
+        for tname, tpaths in decathlon_task_paths.items():
+            w = 1.0 / (num_sources * n_tasks * len(tpaths))
+            for p in tpaths:
+                nifti_paths.append(p)
+                sample_source_weights.append(w)
 
     if args.max_samples and len(nifti_paths) > args.max_samples:
         rng = np.random.RandomState(42)
         idx = rng.choice(len(nifti_paths), args.max_samples, replace=False)
         nifti_paths = [nifti_paths[i] for i in sorted(idx)]
+        sample_source_weights = [sample_source_weights[i] for i in sorted(idx)]
 
-    print(f"\nTotal 3D volumes: {len(nifti_paths)}")
+    print(f"\nTotal 3D volumes: {len(nifti_paths)}  Sources: {num_sources}")
 
     # Create volumetric dataset
     vol_dataset = VolumetricDataset(
         nifti_paths=nifti_paths,
         volume_size=volume_size,
     )
+
+    # VolumetricDataset may drop invalid volumes — rebuild weights to match
+    if hasattr(vol_dataset, 'valid_indices'):
+        sample_source_weights = [sample_source_weights[i] for i in vol_dataset.valid_indices]
+    elif len(vol_dataset) < len(nifti_paths):
+        # Fallback: use uniform weights if we can't track which were dropped
+        sample_source_weights = [1.0 / len(vol_dataset)] * len(vol_dataset)
+
     print(f"Valid volumes: {len(vol_dataset)}")
 
     if len(vol_dataset) == 0:
@@ -540,10 +606,18 @@ def run_vjepa_pretraining(args):
         optimizer, schedulers=[warmup_sched, cosine_sched],
         milestones=[warmup_ep])
 
+    # Build balanced sampler for 3D volumes (BraTS vs Decathlon sources)
+    vjepa_sampler = torch.utils.data.WeightedRandomSampler(
+        weights=torch.tensor(sample_source_weights, dtype=torch.float64),
+        num_samples=len(vol_dataset),
+        replacement=True,
+    )
+    print(f"  V-JEPA balanced sampler ready — {num_sources} sources, {len(vol_dataset)} volumes")
+
     loader = DataLoader(
         vol_dataset,
         batch_size=args.vjepa_batch_size,
-        shuffle=True,
+        sampler=vjepa_sampler,
         num_workers=min(args.num_workers, 2),
         pin_memory=torch.cuda.is_available(),
     )
