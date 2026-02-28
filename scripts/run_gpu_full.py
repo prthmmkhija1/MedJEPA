@@ -196,6 +196,13 @@ def parse_args():
     p.add_argument("--save_every", type=int, default=None)
     p.add_argument("--no_tensorboard", action="store_true",
                    help="Disable TensorBoard logging")
+    # Performance optimizations
+    p.add_argument("--no_split_encoding", action="store_true",
+                   help="Disable split encoding (encode all patches together, slower)")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="Trade ~33%% extra compute for ~2x memory savings (allows bigger batch)")
+    p.add_argument("--no_prefetcher", action="store_true",
+                   help="Disable CUDA stream prefetcher")
 
     raw = p.parse_args()
 
@@ -505,6 +512,8 @@ def run_lejepa_pretraining(args):
     print(f"  Balanced sampler ready — {num_sources} sources, {len(combined)} total samples")
 
     # Build LeJEPA model
+    _split_encoding = not getattr(args, "no_split_encoding", False)
+    _grad_ckpt = getattr(args, "gradient_checkpointing", False)
     model = LeJEPA(
         image_size=args.image_size,
         patch_size=args.patch_size,
@@ -513,9 +522,13 @@ def run_lejepa_pretraining(args):
         predictor_depth=args.predictor_depth,
         mask_ratio=args.mask_ratio,
         lambda_reg=args.lambda_reg,
+        split_encoding=_split_encoding,
+        gradient_checkpointing=_grad_ckpt,
     )
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\nLeJEPA parameters: {total_params:,} ({total_params / 1e6:.1f}M)")
+    print(f"  Split encoding:         {'ON (fast)' if _split_encoding else 'OFF'}")
+    print(f"  Gradient checkpointing: {'ON (saves memory)' if _grad_ckpt else 'OFF'}")
 
     # Training config
     config = {
@@ -540,6 +553,7 @@ def run_lejepa_pretraining(args):
         "use_weighted_sampler": True,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "compile_model": True,
+        "use_prefetcher": not getattr(args, "no_prefetcher", False),
     }
 
     # Train

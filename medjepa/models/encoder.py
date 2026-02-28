@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import math
 from typing import Optional
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 # Enable PyTorch 2.x scaled_dot_product_attention (Flash Attention on A100)
 torch.backends.cuda.enable_flash_sdp(True)
@@ -140,9 +141,11 @@ class ViTEncoder(nn.Module):
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        use_checkpoint: bool = False,  # Gradient checkpointing (saves memory)
     ):
         super().__init__()
         self.embed_dim = embed_dim
+        self.use_checkpoint = use_checkpoint
         num_patches = (image_size // patch_size) ** 2
 
         # Step 1: Patch embedding
@@ -194,7 +197,10 @@ class ViTEncoder(nn.Module):
 
         # Run through Transformer blocks
         for block in self.blocks:
-            x = block(x)
+            if self.use_checkpoint and self.training:
+                x = grad_checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         # Final normalization
         x = self.norm(x)

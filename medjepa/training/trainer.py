@@ -43,6 +43,66 @@ except ImportError:
 
 
 # ----------------------------------------------------------------
+# CUDA Stream Prefetcher: overlap CPU→GPU transfer with compute
+# ----------------------------------------------------------------
+
+class CUDAPrefetcher:
+    """Prefetch the next batch onto the GPU using a side CUDA stream.
+
+    While the current batch is being processed on the default stream,
+    the *next* batch is asynchronously copied to the GPU on a separate
+    stream.  This hides most of the CPU→GPU transfer latency.
+    """
+
+    def __init__(self, loader, device: torch.device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self._base_iter = None
+        self._next_batch = None
+
+    def __iter__(self):
+        self._base_iter = iter(self.loader)
+        self._preload()
+        return self
+
+    def _preload(self):
+        try:
+            batch = next(self._base_iter)
+        except StopIteration:
+            self._next_batch = None
+            return
+        with torch.cuda.stream(self.stream):
+            if isinstance(batch, (list, tuple)):
+                self._next_batch = type(batch)(
+                    t.to(self.device, non_blocking=True) if torch.is_tensor(t) else t
+                    for t in batch
+                )
+            elif torch.is_tensor(batch):
+                self._next_batch = batch.to(self.device, non_blocking=True)
+            else:
+                self._next_batch = batch
+
+    def __next__(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        if self._next_batch is None:
+            raise StopIteration
+        batch = self._next_batch
+        # Ensure tensors record the dependency on the prefetch stream
+        if torch.is_tensor(batch):
+            batch.record_stream(torch.cuda.current_stream())
+        elif isinstance(batch, (list, tuple)):
+            for t in batch:
+                if torch.is_tensor(t):
+                    t.record_stream(torch.cuda.current_stream())
+        self._preload()
+        return batch
+
+    def __len__(self):
+        return len(self.loader)
+
+
+# ----------------------------------------------------------------
 # Safe collate: handle mixed returns & shape mismatches
 # ----------------------------------------------------------------
 
@@ -280,9 +340,27 @@ class MedJEPATrainer:
                 milestones=[self.warmup_epochs])
             self._scheduler_step_per_batch = False
 
-        # Mixed precision training (saves GPU memory)
+        # Mixed precision training (saves GPU memory and boosts throughput)
+        # Prefer BFloat16 on Ampere+ GPUs: wider dynamic range → no GradScaler needed
         self.use_amp = config.get("mixed_precision", False) and torch.cuda.is_available()
-        self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
+        self._amp_dtype = torch.float16  # default
+        if self.use_amp and torch.cuda.is_bf16_supported():
+            self._amp_dtype = torch.bfloat16
+        # GradScaler is only needed for float16 (bf16 has enough dynamic range)
+        self.scaler = (
+            torch.amp.GradScaler("cuda")
+            if self.use_amp and self._amp_dtype == torch.float16
+            else None
+        )
+        if self.use_amp:
+            print(f"  Mixed precision: {self._amp_dtype}  "
+                  f"(GradScaler={'ON' if self.scaler else 'OFF'})")
+
+        # CUDA stream prefetcher: overlap data transfer with GPU compute
+        self._use_prefetcher = (
+            torch.cuda.is_available()
+            and config.get("use_prefetcher", True)
+        )
 
         # Tracking
         self.checkpoint_dir = Path(config.get("checkpoint_dir", "checkpoints"))
@@ -358,10 +436,15 @@ class MedJEPATrainer:
         num_batches = 0
         start_time = time.time()
 
-        loader = self.train_loader
+        # Wrap data loader with CUDA prefetcher (overlaps transfer + compute)
+        base_loader = self.train_loader
+        if self._use_prefetcher:
+            base_loader = CUDAPrefetcher(self.train_loader, self.device)
+
+        loader = base_loader
         if tqdm is not None:
             loader = tqdm(
-                self.train_loader,
+                base_loader,
                 desc=f"Epoch {epoch+1}/{self.config.get('num_epochs',100)}",
                 unit="batch",
                 leave=True,
@@ -375,6 +458,7 @@ class MedJEPATrainer:
             else:
                 images = batch
 
+            # Move to device (no-op if prefetcher already placed on GPU)
             images = images.to(self.device, non_blocking=True)
 
             # Signal start of a new step — needed when CUDA graphs are active
@@ -388,17 +472,24 @@ class MedJEPATrainer:
 
             # Forward pass (with optional mixed precision)
             if self.use_amp:
-                with torch.amp.autocast("cuda"):
+                with torch.amp.autocast("cuda", dtype=self._amp_dtype):
                     losses = self.model(images)
                     loss = losses["total_loss"] / self._grad_accum_steps
 
-                # Backward pass with scaling
-                self.scaler.scale(loss).backward()
-                if (batch_idx + 1) % self._grad_accum_steps == 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                if self.scaler is not None:
+                    # FP16 path: use GradScaler
+                    self.scaler.scale(loss).backward()
+                    if (batch_idx + 1) % self._grad_accum_steps == 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                else:
+                    # BF16 path: no scaler needed (wider dynamic range)
+                    loss.backward()
+                    if (batch_idx + 1) % self._grad_accum_steps == 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        self.optimizer.step()
             else:
                 losses = self.model(images)
                 loss = losses["total_loss"] / self._grad_accum_steps

@@ -9,6 +9,7 @@ what the embeddings of the hidden patches should be.
 import torch
 import torch.nn as nn
 from typing import Optional
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
 class JEPAPredictor(nn.Module):
@@ -29,8 +30,10 @@ class JEPAPredictor(nn.Module):
         depth: int = 6,           # Fewer layers than encoder
         num_heads: int = 6,
         num_patches: int = 196,  # Total patches in the image
+        use_checkpoint: bool = False,  # Gradient checkpointing
     ):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
 
         # Project from encoder dimension to (smaller) predictor dimension
         self.input_proj = nn.Linear(embed_dim, predictor_dim)
@@ -98,7 +101,10 @@ class JEPAPredictor(nn.Module):
 
         # Run through Transformer blocks
         for block in self.blocks:
-            full_sequence = block(full_sequence)
+            if self.use_checkpoint and self.training:
+                full_sequence = grad_checkpoint(block, full_sequence, use_reentrant=False)
+            else:
+                full_sequence = block(full_sequence)
 
         # Extract only the target predictions (last num_target tokens)
         target_predictions = full_sequence[:, -num_target:, :]
