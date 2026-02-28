@@ -96,10 +96,11 @@ class LeJEPA(nn.Module):
         """
         batch_size = images.shape[0]
 
-        # Step 1: Generate mask
+        # Step 1: Generate mask (move indices to GPU immediately so
+        # torch.compile doesn't see CPU tensors in the graph)
         context_indices, target_indices = self.masker.generate_block_mask()
-        context_indices = context_indices.to(images.device)
-        target_indices = target_indices.to(images.device)
+        context_indices = context_indices.to(images.device, non_blocking=True)
+        target_indices = target_indices.to(images.device, non_blocking=True)
 
         # Step 2: Encode ALL patches (full context for both context and target)
         all_embeddings = self.encoder(images)

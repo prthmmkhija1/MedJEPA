@@ -63,10 +63,11 @@ class SIGRegLoss(nn.Module):
         self.lambda_var = lambda_var
         self.lambda_cov = lambda_cov
 
-        # Random projection matrix is created lazily on first forward pass
-        # so that we know the embed_dim and device.
-        self._sketch_matrix: torch.Tensor | None = None
+        # Random projection matrix — registered as a buffer so it moves
+        # with .to(device) and doesn't trigger CUDA-graph recompilation.
+        # Built lazily on first forward pass once we know embed_dim.
         self._sketch_embed_dim: int | None = None
+        self.register_buffer("_sketch_matrix", None)
 
     def _get_sketch_matrix(self, embed_dim: int, device: torch.device) -> torch.Tensor:
         """
@@ -74,12 +75,12 @@ class SIGRegLoss(nn.Module):
         (embed_dim, sketch_dim) scaled by 1/sqrt(sketch_dim).
 
         This is re-created if embed_dim changes or it hasn't been built yet.
-        The matrix is stored as a non-parameter buffer (no gradients).
+        The matrix is registered as a buffer (no gradients, moves with device).
         """
-        if self._sketch_matrix is None or self._sketch_embed_dim != embed_dim or self._sketch_matrix.device != device:
+        if self._sketch_matrix is None or self._sketch_embed_dim != embed_dim:
             k = min(self.sketch_dim, embed_dim)
             R = torch.randn(embed_dim, k, device=device) / math.sqrt(k)
-            self._sketch_matrix = R
+            self.register_buffer("_sketch_matrix", R)
             self._sketch_embed_dim = embed_dim
         return self._sketch_matrix
 

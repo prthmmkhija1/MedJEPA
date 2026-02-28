@@ -175,10 +175,13 @@ class MedJEPATrainer:
                 sampler = self._build_sampler(train_dataset, config)
 
         # ---------- torch.compile for faster forward/backward ----------
+        # Use "max-autotune" instead of "reduce-overhead" because the latter
+        # uses CUDA graphs which crash on dynamic tensors (random sketch
+        # matrices, CPU-originated mask indices, etc.).
         if config.get("compile_model", True) and hasattr(torch, "compile"):
             try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
-                print("  torch.compile enabled (reduce-overhead mode)")
+                self.model = torch.compile(self.model, mode="max-autotune")
+                print("  torch.compile enabled (max-autotune mode)")
             except Exception as e:
                 print(f"  torch.compile unavailable: {e}")
 
@@ -398,8 +401,9 @@ class MedJEPATrainer:
             self._global_step += 1
 
             # OneCycleLR steps per batch; epoch-level schedulers step at epoch end
+            # Only step AFTER the first optimizer.step() has happened
             if getattr(self, '_scheduler_step_per_batch', False):
-                if (batch_idx + 1) % self._grad_accum_steps == 0:
+                if (batch_idx + 1) % self._grad_accum_steps == 0 and self._global_step > 1:
                     self.scheduler.step()
 
             # TensorBoard per-step logging (throttled to reduce GPU sync overhead)
