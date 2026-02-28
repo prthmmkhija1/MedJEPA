@@ -331,13 +331,24 @@ class NIfTISliceDataset(Dataset):
         self._cache = {}
         self._cache_order = []
         self._cache_max = 5
+        self._corrupted_paths = set()  # Track corrupted files to avoid retrying
 
     def _load_volume(self, path: str) -> np.ndarray:
         """Load a NIfTI volume, with simple caching."""
+        if path in self._corrupted_paths:
+            raise IOError(f"Previously identified corrupted NIfTI file: {path}")
         if path in self._cache:
             return self._cache[path]
         import nibabel as nib
-        vol = nib.load(path).get_fdata().astype(np.float32)
+        try:
+            vol = nib.load(path).get_fdata().astype(np.float32)
+        except (EOFError, OSError, Exception) as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Skipping corrupted NIfTI file {path}: {e}"
+            )
+            self._corrupted_paths.add(path)
+            raise IOError(f"Corrupted NIfTI file: {path}") from e
         # Cache management
         if len(self._cache_order) >= self._cache_max:
             old = self._cache_order.pop(0)
@@ -351,7 +362,14 @@ class NIfTISliceDataset(Dataset):
 
     def __getitem__(self, idx):
         npath, slice_idx = self.samples[idx]
-        vol = self._load_volume(npath)
+        try:
+            vol = self._load_volume(npath)
+        except (IOError, OSError):
+            # Return a blank image for corrupted volumes so training can continue
+            blank = torch.zeros(3, *self.target_size, dtype=torch.float32)
+            if self.labels is not None:
+                return blank, int(self.labels[idx])
+            return blank
 
         # Extract axial slice
         if len(vol.shape) == 4:
@@ -655,7 +673,16 @@ class VolumetricDataset(Dataset):
         import nibabel as nib
         from scipy.ndimage import zoom
 
-        vol = nib.load(self.nifti_paths[idx]).get_fdata().astype(np.float32)
+        try:
+            vol = nib.load(self.nifti_paths[idx]).get_fdata().astype(np.float32)
+        except (EOFError, OSError, Exception) as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Skipping corrupted NIfTI volume {self.nifti_paths[idx]}: {e}"
+            )
+            # Return a blank volume so training doesn't crash
+            vol = np.zeros(self.volume_size, dtype=np.float32)
+            return torch.tensor(vol, dtype=torch.float32).unsqueeze(0)
 
         # If 4D (multi-channel), take first channel
         if vol.ndim == 4:
