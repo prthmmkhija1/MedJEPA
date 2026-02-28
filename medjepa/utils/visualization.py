@@ -8,6 +8,7 @@ These visuals help answer:
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
@@ -290,6 +291,222 @@ def plot_evaluation_summary(
     ax.set_ylim(0, 105)
     ax.grid(True, alpha=0.3, axis="y")
 
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+# ===================================================================
+# GradCAM — Gradient-weighted Class Activation Mapping
+# ===================================================================
+
+class GradCAM:
+    """
+    Gradient-weighted Class Activation Mapping for Vision Transformers.
+
+    GradCAM highlights the image regions most responsible for a particular
+    class prediction by combining the gradients flowing back into the last
+    transformer block with its activations.
+
+    Usage::
+
+        cam = GradCAM(model)
+        heatmap = cam(image_tensor, target_class=3)
+        # heatmap is a (H_grid, W_grid) numpy array in [0, 1]
+    """
+
+    def __init__(self, model: torch.nn.Module, target_layer: Optional[str] = None):
+        """
+        Args:
+            model: A LeJEPA (or any model with ``.encoder.blocks``).
+            target_layer: Name of the layer to hook. If None, uses the last
+                          transformer block's ``norm1`` output (pre-attention).
+        """
+        self.model = model
+        self.device = next(model.parameters()).device
+
+        # Resolve target layer
+        encoder = model.encoder if hasattr(model, "encoder") else model
+        if target_layer is not None:
+            self._target = dict(encoder.named_modules())[target_layer]
+        else:
+            # Default: last block's first norm (captures token activations)
+            self._target = encoder.blocks[-1].norm1
+
+        # Storage for hooks
+        self._activations: Optional[torch.Tensor] = None
+        self._gradients: Optional[torch.Tensor] = None
+
+        # Register hooks
+        self._fwd_handle = self._target.register_forward_hook(self._save_activation)
+        self._bwd_handle = self._target.register_full_backward_hook(self._save_gradient)
+
+    def _save_activation(self, module, input, output):
+        self._activations = output.detach()
+
+    def _save_gradient(self, module, grad_input, grad_output):
+        self._gradients = grad_output[0].detach()
+
+    def __call__(
+        self,
+        image: torch.Tensor,
+        target_class: Optional[int] = None,
+        probe: Optional[torch.nn.Module] = None,
+    ) -> np.ndarray:
+        """
+        Compute GradCAM heatmap.
+
+        Args:
+            image: (C, H, W) or (1, C, H, W) input tensor.
+            target_class: Class index to compute the CAM for.  If None,
+                          uses the predicted class.
+            probe: A classification head (e.g. ``LinearProbe``) appended on
+                   top of the encoder.  If None, the raw CLS / mean-token
+                   logits are used.
+
+        Returns:
+            heatmap: 2D numpy array (grid_H, grid_W) in [0, 1].
+        """
+        self.model.eval()
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+        image = image.to(self.device).requires_grad_(True)
+
+        # Forward through encoder to get token embeddings
+        encoder = self.model.encoder if hasattr(self.model, "encoder") else self.model
+        tokens = encoder(image)  # (1, N, D)
+
+        # Classification logits
+        if probe is not None:
+            probe = probe.to(self.device)
+            pooled = tokens.mean(dim=1)  # (1, D)
+            logits = probe(pooled)  # (1, C)
+        else:
+            logits = tokens.mean(dim=1)  # (1, D) – treat each dim as a "logit"
+
+        if target_class is None:
+            target_class = logits.argmax(dim=-1).item()
+
+        # Backward from target class score
+        self.model.zero_grad()
+        score = logits[0, target_class]
+        score.backward(retain_graph=True)
+
+        if self._gradients is None or self._activations is None:
+            raise RuntimeError("GradCAM hooks did not fire. Check target layer.")
+
+        # Grad-weighted activations
+        weights = self._gradients.mean(dim=-1, keepdim=True)  # (1, N, 1)
+        cam = (weights * self._activations).sum(dim=-1)  # (1, N)
+        cam = F.relu(cam)[0]  # (N,)
+
+        # Reshape to 2D grid
+        grid_size = int(cam.shape[0] ** 0.5)
+        if grid_size * grid_size != cam.shape[0]:
+            grid_size = int(np.ceil(cam.shape[0] ** 0.5))
+            padded = torch.zeros(grid_size * grid_size, device=cam.device)
+            padded[: cam.shape[0]] = cam
+            cam = padded
+
+        cam_2d = cam.reshape(grid_size, grid_size).cpu().numpy()
+
+        # Normalize to [0, 1]
+        cam_min, cam_max = cam_2d.min(), cam_2d.max()
+        if cam_max - cam_min > 0:
+            cam_2d = (cam_2d - cam_min) / (cam_max - cam_min)
+
+        return cam_2d
+
+    def remove_hooks(self):
+        """Remove forward / backward hooks (call when done)."""
+        self._fwd_handle.remove()
+        self._bwd_handle.remove()
+
+
+def compute_saliency_map(
+    model: torch.nn.Module,
+    image: torch.Tensor,
+) -> np.ndarray:
+    """
+    Compute a vanilla gradient saliency map.
+
+    Returns the absolute gradient of the model output w.r.t. the input
+    image, averaged across colour channels.
+
+    Args:
+        model: LeJEPA or encoder model.
+        image: (C, H, W) or (1, C, H, W) tensor.
+
+    Returns:
+        saliency: (H, W) numpy array normalised to [0, 1].
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    if image.dim() == 3:
+        image = image.unsqueeze(0)
+    image = image.to(device).requires_grad_(True)
+
+    encoder = model.encoder if hasattr(model, "encoder") else model
+    tokens = encoder(image)
+    # Use squared norm of mean-pooled representation as scalar objective
+    pooled = tokens.mean(dim=1)
+    scalar = (pooled ** 2).sum()
+    scalar.backward()
+
+    grad = image.grad.data.abs()  # (1, C, H, W)
+    saliency = grad[0].mean(dim=0).cpu().numpy()  # (H, W)
+
+    s_min, s_max = saliency.min(), saliency.max()
+    if s_max - s_min > 0:
+        saliency = (saliency - s_min) / (s_max - s_min)
+    return saliency
+
+
+def plot_gradcam(
+    image: np.ndarray,
+    heatmap: np.ndarray,
+    title: str = "GradCAM",
+    save_path: Optional[str] = None,
+):
+    """
+    Overlay a GradCAM heatmap on a medical image.
+
+    Args:
+        image: Original image (H, W) or (H, W, 3) in [0, 1].
+        heatmap: (grid_H, grid_W) in [0, 1] — will be up-sampled.
+        title: Plot title.
+        save_path: If set, saves the figure.
+    """
+    from PIL import Image as PILImage
+
+    if image.ndim == 3:
+        display_img = image
+    else:
+        display_img = np.stack([image] * 3, axis=-1)
+
+    H, W = display_img.shape[:2]
+
+    # Up-sample heatmap to image resolution
+    hm_pil = PILImage.fromarray((heatmap * 255).astype(np.uint8))
+    hm_pil = hm_pil.resize((W, H), PILImage.BILINEAR)
+    hm_up = np.array(hm_pil, dtype=np.float32) / 255.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    axes[0].imshow(display_img)
+    axes[0].set_title("Original")
+    axes[0].axis("off")
+
+    axes[1].imshow(hm_up, cmap="jet")
+    axes[1].set_title("GradCAM")
+    axes[1].axis("off")
+
+    axes[2].imshow(display_img)
+    axes[2].imshow(hm_up, cmap="jet", alpha=0.5)
+    axes[2].set_title("Overlay")
+    axes[2].axis("off")
+
+    plt.suptitle(title, fontsize=14)
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()

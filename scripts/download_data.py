@@ -191,23 +191,49 @@ def download_decathlon():
             run("pip install gdown")
 
         # Google Drive IDs for Decathlon tasks (official mirrors)
+        # Source: http://medicaldecathlon.com/
         gdrive_tasks = {
-            "Task02_Heart":      "1wEB2I6S6tQBVEPxir8cA7kFB7go4hBME",
+            "Task01_BrainTumour": "1A2IU8Sgea1h3fYLpYtFb2v7NYdMjW765",
+            "Task02_Heart":       "1wEB2I6S6tQBVEPxir8cA7kFB7go4hBME",
+            "Task03_Liver":       "1jyVGmCPkFkBJeZ8xEinCtaY0HzN1HmBy",
             "Task04_Hippocampus": "1RzPB1_bqzQhlWvU-YGvZzhx2omcDh38C",
-            "Task05_Prostate":   "1Ff7c21UksxyT4JfETjaarmuKEjdqe1-a",
-            "Task09_Spleen":     "1jzeNU1EKnK81PyTsrx0ujfNl-t0Jo8uE",
+            "Task05_Prostate":    "1Ff7c21UksxyT4JfETjaarmuKEjdqe1-a",
+            "Task06_Lung":        "1I1LR7XjyEZ-VBQ-Xruh31V7xExMjlVvi",
+            "Task07_Pancreas":    "1YZQFAoXXCSS-DeRwZaauaRTLvyCFkPf8",
+            "Task08_HepaticVessel": "1qVrpV7vmhIsUxFiH189LmAn0ALbAPrgS",
+            "Task09_Spleen":      "1jzeNU1EKnK81PyTsrx0ujfNl-t0Jo8uE",
+            "Task10_Colon":       "1m7tMpE9qEcQGQjL_BdMD-Mvgmc44hG1Y",
         }
         for task_name, gdrive_id in gdrive_tasks.items():
             task_dir = out / task_name
             if task_dir.exists() and (task_dir / "dataset.json").exists():
                 print(f"  {task_name} already exists, skipping.")
                 continue
-            print(f"  Downloading {task_name}...")
+            # Check if a (possibly corrupted) tar already exists; verify it first
             tar_path = out / f"{task_name}.tar"
-            run(f"gdown --id {gdrive_id} -O {tar_path}")
             if tar_path.exists():
-                run(f"tar -xf {tar_path} -C {out}")
-                tar_path.unlink()
+                result = subprocess.run(
+                    f"tar -tf {tar_path} > /dev/null 2>&1", shell=True
+                )
+                if result.returncode != 0:
+                    print(f"  {task_name}.tar is corrupted — removing and re-downloading...")
+                    tar_path.unlink()
+                else:
+                    print(f"  {task_name}.tar already downloaded and valid.")
+            if not tar_path.exists():
+                print(f"  Downloading {task_name}...")
+                run(f"gdown --id {gdrive_id} -O {tar_path} --fuzzy")
+            if tar_path.exists():
+                # Verify before extracting
+                verify = subprocess.run(
+                    f"tar -tf {tar_path} > /dev/null 2>&1", shell=True
+                )
+                if verify.returncode == 0:
+                    run(f"tar -xf {tar_path} -C {out}")
+                    tar_path.unlink()
+                else:
+                    print(f"  ERROR: {task_name}.tar failed integrity check — skipping extraction.")
+                    print(f"  Try manually: gdown --id {gdrive_id} -O {tar_path} --fuzzy")
 
     # Report what we have
     tasks = [d.name for d in out.iterdir() if d.is_dir() and d.name.startswith("Task")]

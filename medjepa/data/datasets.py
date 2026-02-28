@@ -380,10 +380,59 @@ class BraTSDataset(NIfTISliceDataset):
         max_subjects: Optional[int] = None,
     ):
         data_dir = Path(data_dir)
+
+        # ── Auto-extract .tar / .tar.gz archives if present ──
+        tar_files = list(data_dir.glob("*.tar*")) + list(data_dir.glob("*.tgz"))
+        if tar_files:
+            import tarfile
+            for tf_path in tar_files:
+                # Skip if already extracted (marker file)
+                marker = tf_path.with_suffix(tf_path.suffix + ".extracted")
+                if marker.exists():
+                    continue
+                try:
+                    print(f"  Extracting {tf_path.name} ...")
+                    with tarfile.open(str(tf_path), "r:*") as tar:
+                        tar.extractall(path=str(data_dir))
+                    marker.touch()  # mark as extracted
+                    print(f"  Extracted {tf_path.name}")
+                except Exception as e:
+                    print(f"  WARNING: Failed to extract {tf_path.name}: {e}")
+
+        # Look for subject dirs (BraTS2021_NNNNN) — search recursively
+        # to handle cases where data is nested inside a parent folder
+        # like BraTS2021_Training/ extracted from an archive.
         subject_dirs = sorted([
             d for d in data_dir.iterdir()
             if d.is_dir() and d.name.startswith("BraTS")
         ])
+
+        # Check if any found dirs are "container" folders (no NIfTI files
+        # inside, but contain subject sub-directories instead)
+        expanded = []
+        for d in subject_dirs:
+            # A real subject dir has *_flair.nii.gz; a container has sub-dirs
+            has_nifti = any(d.glob(f"{d.name}_{modality}.nii.gz"))
+            if has_nifti:
+                expanded.append(d)
+            else:
+                # Look one level deeper for actual subject directories
+                nested = sorted([
+                    sd for sd in d.iterdir()
+                    if sd.is_dir() and sd.name.startswith("BraTS")
+                ])
+                if nested:
+                    expanded.extend(nested)
+        subject_dirs = expanded
+
+        if not subject_dirs:
+            import warnings
+            warnings.warn(
+                f"BraTSDataset: No valid subject directories found in {data_dir}. "
+                f"Expected folders like BraTS2021_00000/ containing "
+                f"BraTS2021_00000_{modality}.nii.gz files. "
+                f"If you have .tar archives, they should be auto-extracted."
+            )
 
         if max_subjects and max_subjects < len(subject_dirs):
             rng = np.random.RandomState(42)
@@ -484,7 +533,9 @@ class DecathlonDataset(NIfTISliceDataset):
         nifti_paths = []
         labels = [] if with_labels else None
 
-        for vol_idx, entry in enumerate(meta.get("training", [])):
+        training_entries = meta.get("training", [])
+        missing_count = 0
+        for vol_idx, entry in enumerate(training_entries):
             img_rel = entry["image"]  # e.g. "./imagesTr/la_007.nii.gz"
             img_path = task_dir / img_rel.lstrip("./")
             if img_path.exists():
@@ -505,6 +556,37 @@ class DecathlonDataset(NIfTISliceDataset):
                             labels.append(vol_idx % 2)
                     else:
                         labels.append(vol_idx % 2)
+            else:
+                missing_count += 1
+
+        if missing_count > 0 and len(nifti_paths) == 0:
+            # All training entries are missing — try fallback strategies
+            images_tr = task_dir / "imagesTr"
+            images_ts = task_dir / "imagesTs"
+            tr_files = sorted(images_tr.glob("*.nii.gz")) if images_tr.exists() else []
+            ts_files = sorted(images_ts.glob("*.nii.gz")) if images_ts.exists() else []
+
+            if tr_files:
+                # imagesTr has files but paths in dataset.json didn't match
+                print(f"  DecathlonDataset ({task}): Using {len(tr_files)} "
+                      f"NIfTI files found directly in imagesTr/")
+                nifti_paths = [str(p) for p in tr_files]
+                if with_labels:
+                    labels = [0] * len(nifti_paths)
+            elif ts_files:
+                # imagesTr is empty but imagesTs has data — use test images
+                # for self-supervised pre-training (no labels needed)
+                print(f"  DecathlonDataset ({task}): imagesTr/ is empty, "
+                      f"falling back to {len(ts_files)} files from imagesTs/")
+                nifti_paths = [str(p) for p in ts_files]
+                if with_labels:
+                    labels = [0] * len(nifti_paths)
+            else:
+                import warnings
+                warnings.warn(
+                    f"DecathlonDataset ({task}): No NIfTI files found in "
+                    f"imagesTr/ or imagesTs/. The data may not be downloaded."
+                )
 
         super().__init__(
             nifti_paths=nifti_paths,

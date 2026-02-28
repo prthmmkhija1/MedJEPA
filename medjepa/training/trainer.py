@@ -7,14 +7,19 @@ This is like a gym workout routine:
 3. Compute how wrong it was (feedback)
 4. Adjust the model weights to be less wrong next time (improve)
 5. Repeat thousands of times
+
+Supports both single-GPU and multi-GPU (DDP) training.
 """
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, WeightedRandomSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, WeightedRandomSampler, DistributedSampler
 from pathlib import Path
 import time
 import json
+import os
 import numpy as np
 from typing import Optional
 from medjepa.utils.device import get_device
@@ -26,6 +31,39 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     SummaryWriter = None
+
+
+# ----------------------------------------------------------------
+# DDP helper utilities
+# ----------------------------------------------------------------
+
+def setup_ddp(rank: int, world_size: int, backend: str = "nccl"):
+    """
+    Initialize the distributed process group.
+
+    Args:
+        rank: Global rank of this process (0 = master).
+        world_size: Total number of processes.
+        backend: "nccl" (GPU, recommended), "gloo" (CPU fallback).
+    """
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "12355")
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+
+
+def cleanup_ddp():
+    """Destroy the distributed process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process() -> bool:
+    """Return True if this is rank 0 or DDP is not active."""
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
 
 
 class MedJEPATrainer:
@@ -45,18 +83,45 @@ class MedJEPATrainer:
         Args:
             model: The LeJEPA or VJEPA model
             train_dataset: Training data (PyTorch Dataset)
-            config: Configuration dictionary
+            config: Configuration dictionary.  DDP keys:
+                    - ``distributed``: bool — enable DistributedDataParallel
+                    - ``local_rank``: int — GPU device index for this process
+                    - ``world_size``: int — total number of processes
             val_dataset: Optional validation data
-            sampler: Optional pre-built WeightedRandomSampler (overrides _build_sampler)
+            sampler: Optional pre-built WeightedRandomSampler (overrides _build_sampler).
+                     Ignored when ``distributed=True`` (a DistributedSampler is used).
         """
         self.model = model
         self.config = config
-        self.device = get_device()
-        self.model = self.model.to(self.device)
 
-        # Use provided sampler, or build one from labels if available
-        if sampler is None:
-            sampler = self._build_sampler(train_dataset, config)
+        # ---------- DDP setup ----------
+        self.distributed = config.get("distributed", False)
+        self.local_rank = config.get("local_rank", 0)
+        self.world_size = config.get("world_size", 1)
+
+        if self.distributed:
+            self.device = torch.device(f"cuda:{self.local_rank}")
+            self.model = self.model.to(self.device)
+            self.model = DDP(
+                self.model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=False,
+            )
+            # DDP requires DistributedSampler — override any provided sampler
+            sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.local_rank,
+                shuffle=True,
+            )
+        else:
+            self.device = get_device()
+            self.model = self.model.to(self.device)
+
+            # Use provided sampler, or build one from labels if available
+            if sampler is None:
+                sampler = self._build_sampler(train_dataset, config)
 
         # DataLoader: feeds batches of images to the model
         self.train_loader = DataLoader(
@@ -286,16 +351,23 @@ class MedJEPATrainer:
         save_every = self.config.get("save_every", 5)
         best_loss = float("inf")
 
-        print("=" * 60)
-        print(f"Starting MedJEPA Training")
-        print(f"Device: {self.device}")
-        print(f"Epochs: {num_epochs}")
-        print(f"Batch size: {self.config.get('batch_size', 32)}")
-        print(f"Training samples: {len(self.train_loader.dataset)}")
-        print("=" * 60)
+        if is_main_process():
+            print("=" * 60)
+            print(f"Starting MedJEPA Training")
+            print(f"Device: {self.device}")
+            if self.distributed:
+                print(f"DDP: rank {self.local_rank} / world_size {self.world_size}")
+            print(f"Epochs: {num_epochs}")
+            print(f"Batch size: {self.config.get('batch_size', 32)}")
+            print(f"Training samples: {len(self.train_loader.dataset)}")
+            print("=" * 60)
 
         for epoch in range(num_epochs):
             epoch_start = time.time()
+
+            # DDP: set epoch so shuffling differs each epoch
+            if self.distributed and hasattr(self.train_loader.sampler, 'set_epoch'):
+                self.train_loader.sampler.set_epoch(epoch)
 
             # Train
             train_loss = self.train_one_epoch(epoch)
@@ -311,25 +383,27 @@ class MedJEPATrainer:
                 self.tb_writer.add_scalar("train/lr", lr, epoch)
                 self.tb_writer.add_scalar("train/epoch_time_s", epoch_time, epoch)
 
-            print(
-                f"\nEpoch {epoch+1}/{num_epochs} completed | "
-                f"Train Loss: {train_loss:.4f} | "
-                f"LR: {lr:.6f} | "
-                f"Time: {epoch_time:.1f}s\n"
-            )
+            if is_main_process():
+                print(
+                    f"\nEpoch {epoch+1}/{num_epochs} completed | "
+                    f"Train Loss: {train_loss:.4f} | "
+                    f"LR: {lr:.6f} | "
+                    f"Time: {epoch_time:.1f}s\n"
+                )
 
-            # Save checkpoint
-            if (epoch + 1) % save_every == 0:
-                self.save_checkpoint(epoch, train_loss)
+            # Save checkpoint (only on main process)
+            if is_main_process():
+                if (epoch + 1) % save_every == 0:
+                    self.save_checkpoint(epoch, train_loss)
 
-            # Save best model
-            if train_loss < best_loss:
-                best_loss = train_loss
-                self.save_checkpoint(epoch, train_loss, is_best=True)
+                if train_loss < best_loss:
+                    best_loss = train_loss
+                    self.save_checkpoint(epoch, train_loss, is_best=True)
 
-        print("=" * 60)
-        print(f"Training complete! Best loss: {best_loss:.4f}")
-        print("=" * 60)
+        if is_main_process():
+            print("=" * 60)
+            print(f"Training complete! Best loss: {best_loss:.4f}")
+            print("=" * 60)
 
         if self.tb_writer is not None:
             self.tb_writer.close()
@@ -346,9 +420,12 @@ class MedJEPATrainer:
         filename = "best_model.pt" if is_best else f"checkpoint_epoch_{epoch+1}.pt"
         path = self.checkpoint_dir / filename
 
+        # Unwrap DDP module if present
+        model_to_save = self.model.module if hasattr(self.model, "module") else self.model
+
         checkpoint = {
             "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "loss": loss,

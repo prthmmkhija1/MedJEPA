@@ -8,7 +8,38 @@ import torch
 from PIL import Image
 from pathlib import Path
 import pydicom
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
+
+
+# ----------------------------------------------------------------
+# CT Window Presets  (center, width) in Hounsfield Units
+# ----------------------------------------------------------------
+CT_WINDOW_PRESETS: Dict[str, Tuple[float, float]] = {
+    "soft_tissue": (40.0, 400.0),
+    "lung":        (-600.0, 1500.0),
+    "bone":        (400.0, 1800.0),
+    "brain":       (40.0, 80.0),
+    "liver":       (60.0, 150.0),
+    "mediastinum": (50.0, 350.0),
+}
+
+
+def apply_ct_window(
+    image: np.ndarray,
+    center: float,
+    width: float,
+) -> np.ndarray:
+    """
+    Apply a CT windowing (window center / window width) to a Hounsfield-unit
+    image and rescale the result to [0, 1].
+
+    Pixels below (center - width/2) become 0; pixels above (center + width/2)
+    become 1.  Everything in between is linearly mapped.
+    """
+    low = center - width / 2.0
+    high = center + width / 2.0
+    windowed = np.clip(image, low, high)
+    return (windowed - low) / max(high - low, 1e-8)
 
 
 class MedicalImagePreprocessor:
@@ -21,12 +52,26 @@ class MedicalImagePreprocessor:
     - Handle grayscale vs color images consistently
     """
 
-    def __init__(self, target_size: Tuple[int, int] = (224, 224)):
+    def __init__(
+        self,
+        target_size: Tuple[int, int] = (224, 224),
+        normalization: str = "minmax",
+        # "minmax"  — simple min-max scaling to [0, 1]  (default, works for all)
+        # "zscore"  — zero-mean unit-variance (useful for MRI)
+        # "ct_window" — CT Hounsfield windowing (see ct_window_preset)
+        ct_window_preset: str = "soft_tissue",
+        # Only used when normalization="ct_window".  One of the keys in
+        # CT_WINDOW_PRESETS, or pass custom (center, width).
+    ):
         """
         Args:
             target_size: What size to make all images. (224, 224) is standard for ViT.
+            normalization: Intensity normalization strategy.
+            ct_window_preset: Preset name for CT windowing.
         """
         self.target_size = target_size
+        self.normalization = normalization
+        self.ct_window_preset = ct_window_preset
 
     def load_image(self, path: str) -> np.ndarray:
         """
@@ -72,19 +117,35 @@ class MedicalImagePreprocessor:
 
     def normalize_intensity(self, image: np.ndarray) -> np.ndarray:
         """
-        Scale pixel values to 0-1 range.
+        Scale pixel values according to the selected normalization strategy.
 
-        Why: Different scanners produce different value ranges.
-        An X-ray from Hospital A might have values 0-4095,
-        while Hospital B produces 0-65535.
-        Normalizing to 0-1 makes them comparable.
+        - minmax: Maps [min, max] → [0, 1].
+        - zscore: Zero-mean, unit-variance (then clipped to roughly [0, 1]).
+        - ct_window: Applies CT windowing preset then maps to [0, 1].
         """
-        # Handle edge case: image is all one value
-        img_min = image.min()
-        img_max = image.max()
-        if img_max - img_min == 0:
-            return np.zeros_like(image)
-        return (image - img_min) / (img_max - img_min)
+        if self.normalization == "zscore":
+            mean = image.mean()
+            std = image.std()
+            if std < 1e-8:
+                return np.zeros_like(image)
+            normed = (image - mean) / std
+            # Clip to [-3, 3] standard deviations and rescale to [0, 1]
+            normed = np.clip(normed, -3.0, 3.0)
+            return (normed + 3.0) / 6.0
+
+        elif self.normalization == "ct_window":
+            preset = CT_WINDOW_PRESETS.get(
+                self.ct_window_preset,
+                CT_WINDOW_PRESETS["soft_tissue"],
+            )
+            return apply_ct_window(image, center=preset[0], width=preset[1])
+
+        else:  # minmax (default)
+            img_min = image.min()
+            img_max = image.max()
+            if img_max - img_min == 0:
+                return np.zeros_like(image)
+            return (image - img_min) / (img_max - img_min)
 
     def resize_image(self, image: np.ndarray) -> np.ndarray:
         """Resize image to target size. Expects input in [0, 1] range."""
@@ -153,8 +214,19 @@ class VolumetricPreprocessor:
         self,
         target_size: Tuple[int, int, int] = (128, 128, 64),
         # width=128, height=128, depth=64 slices
+        target_spacing: Optional[Tuple[float, float, float]] = None,
+        # If set (e.g. (1.0, 1.0, 1.0) mm), volumes are resampled to isotropic
+        # voxel spacing *before* resizing to target_size. Requires the NIfTI
+        # header to contain valid affine/spacing info.
+        normalization: str = "minmax",
+        # "minmax" — default; "zscore" — zero-mean unit-variance;
+        # "ct_window" — CT Hounsfield windowing (see ct_window_preset)
+        ct_window_preset: str = "soft_tissue",
     ):
         self.target_size = target_size
+        self.target_spacing = target_spacing
+        self.normalization = normalization
+        self.ct_window_preset = ct_window_preset
 
     def load_nifti_volume(self, path: str) -> np.ndarray:
         """Load a full 3D volume from a NIfTI file."""
@@ -163,12 +235,56 @@ class VolumetricPreprocessor:
         volume = nii.get_fdata().astype(np.float32)
         return volume
 
+    def load_nifti_with_header(self, path: str):
+        """Load a NIfTI file and return (volume, header, affine)."""
+        import nibabel as nib
+        nii = nib.load(path)
+        return nii.get_fdata().astype(np.float32), nii.header, nii.affine
+
+    def resample_to_spacing(
+        self,
+        volume: np.ndarray,
+        current_spacing: Tuple[float, float, float],
+        target_spacing: Tuple[float, float, float],
+    ) -> np.ndarray:
+        """
+        Resample a volume so that each voxel has the desired physical spacing.
+
+        This is important because different scanners produce volumes with
+        different voxel sizes (e.g., 0.5mm × 0.5mm × 5mm vs 1mm × 1mm × 1mm).
+        Resampling to a uniform spacing makes volumes comparable.
+        """
+        from scipy.ndimage import zoom
+
+        zoom_factors = [
+            cs / ts for cs, ts in zip(current_spacing, target_spacing)
+        ]
+        resampled = zoom(volume, zoom_factors, order=1)
+        return resampled
+
     def normalize_volume(self, volume: np.ndarray) -> np.ndarray:
-        """Normalize the entire 3D volume to 0-1 range."""
-        v_min, v_max = volume.min(), volume.max()
-        if v_max - v_min == 0:
-            return np.zeros_like(volume)
-        return (volume - v_min) / (v_max - v_min)
+        """Normalize the entire 3D volume using the selected strategy."""
+        if self.normalization == "zscore":
+            mean = volume.mean()
+            std = volume.std()
+            if std < 1e-8:
+                return np.zeros_like(volume)
+            normed = (volume - mean) / std
+            normed = np.clip(normed, -3.0, 3.0)
+            return (normed + 3.0) / 6.0
+
+        elif self.normalization == "ct_window":
+            preset = CT_WINDOW_PRESETS.get(
+                self.ct_window_preset,
+                CT_WINDOW_PRESETS["soft_tissue"],
+            )
+            return apply_ct_window(volume, center=preset[0], width=preset[1])
+
+        else:  # minmax
+            v_min, v_max = volume.min(), volume.max()
+            if v_max - v_min == 0:
+                return np.zeros_like(volume)
+            return (volume - v_min) / (v_max - v_min)
 
     def resize_volume(self, volume: np.ndarray) -> np.ndarray:
         """Resize 3D volume to target size using simple interpolation."""
@@ -182,8 +298,29 @@ class VolumetricPreprocessor:
         return resized
 
     def preprocess(self, path: str) -> np.ndarray:
-        """Full 3D preprocessing pipeline."""
-        volume = self.load_nifti_volume(path)
+        """
+        Full 3D preprocessing pipeline.
+
+        If ``target_spacing`` is configured, spacing-aware resampling is
+        applied before resizing (requires the NIfTI header).
+        """
+        import nibabel as nib
+
+        nii = nib.load(path)
+        volume = nii.get_fdata().astype(np.float32)
+
+        # Spacing-aware resampling (optional)
+        if self.target_spacing is not None:
+            try:
+                hdr = nii.header
+                current_spacing = tuple(hdr.get_zooms()[:3])
+                if all(s > 0 for s in current_spacing):
+                    volume = self.resample_to_spacing(
+                        volume, current_spacing, self.target_spacing,
+                    )
+            except Exception:
+                pass  # fall through to plain resize
+
         volume = self.normalize_volume(volume)
         volume = self.resize_volume(volume)
         return volume

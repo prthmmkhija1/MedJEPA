@@ -7,26 +7,36 @@ Lower loss = better predictions. The model tries to minimize this number.
 SIGReg = Sketched Isotropic Gaussian Regularization
 This is the KEY innovation of LeJEPA. It prevents "collapse" — when the model
 cheats by making all embeddings identical (which would be useless).
+
+The "Sketched" part uses random projections to compute the covariance
+regularisation efficiently in a lower-dimensional space, which is critical
+when embed_dim is large.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
 class SIGRegLoss(nn.Module):
     """
     Sketched Isotropic Gaussian Regularization loss.
 
-    Has two parts:
+    Has THREE parts:
     1. PREDICTION LOSS: The predicted target embeddings should match
        the actual target embeddings (MSE — Mean Squared Error).
 
-    2. REGULARIZATION: The embeddings should be spread out (not all the same).
-       Specifically, the distribution of embeddings should look like a
-       "nice" Gaussian (bell curve) — spread evenly in all directions.
+    2. VARIANCE LOSS: Each embedding dimension should have non-trivial
+       variance (prevents collapse to a constant).
 
-    The single trade-off hyperparameter (lambda_reg) balances these two goals.
+    3. COVARIANCE (SKETCHED) LOSS: The off-diagonal elements of the
+       covariance matrix (computed in a *sketched* lower-dim space via
+       random projection) should be close to zero.  Combined with the
+       variance term this pushes the distribution toward an isotropic
+       Gaussian.
+
+    The single trade-off hyperparameter (lambda_reg) balances these goals.
     """
 
     def __init__(
@@ -34,9 +44,44 @@ class SIGRegLoss(nn.Module):
         lambda_reg: float = 1.0,
         # The ONE hyperparameter: how much to emphasize regularization
         # vs prediction accuracy. Start with 1.0.
+        sketch_dim: int = 256,
+        # Dimensionality of the random sketch. Lower → faster but noisier.
+        # Default 256 is a good balance.  Set to 0 to disable sketching
+        # and use the full covariance (legacy behaviour).
+        variance_target: float = 1.0,
+        # Target standard deviation per dimension. Embeddings are pushed
+        # so that each coordinate's std is close to this value.
+        lambda_var: float = 1.0,
+        # Weight for the variance regularization term.
+        lambda_cov: float = 0.04,
+        # Weight for the off-diagonal covariance term.
     ):
         super().__init__()
         self.lambda_reg = lambda_reg
+        self.sketch_dim = sketch_dim
+        self.variance_target = variance_target
+        self.lambda_var = lambda_var
+        self.lambda_cov = lambda_cov
+
+        # Random projection matrix is created lazily on first forward pass
+        # so that we know the embed_dim and device.
+        self._sketch_matrix: torch.Tensor | None = None
+        self._sketch_embed_dim: int | None = None
+
+    def _get_sketch_matrix(self, embed_dim: int, device: torch.device) -> torch.Tensor:
+        """
+        Return a fixed random Gaussian projection matrix R of shape
+        (embed_dim, sketch_dim) scaled by 1/sqrt(sketch_dim).
+
+        This is re-created if embed_dim changes or it hasn't been built yet.
+        The matrix is stored as a non-parameter buffer (no gradients).
+        """
+        if self._sketch_matrix is None or self._sketch_embed_dim != embed_dim or self._sketch_matrix.device != device:
+            k = min(self.sketch_dim, embed_dim)
+            R = torch.randn(embed_dim, k, device=device) / math.sqrt(k)
+            self._sketch_matrix = R
+            self._sketch_embed_dim = embed_dim
+        return self._sketch_matrix
 
     def prediction_loss(
         self,
@@ -59,42 +104,82 @@ class SIGRegLoss(nn.Module):
         loss = F.mse_loss(predicted, target)
         return loss
 
+    def variance_loss(
+        self,
+        embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Encourage each dimension to have standard deviation close to
+        ``variance_target``.  This is the explicit anti-collapse term:
+        if any dimension's std drops to zero, this loss spikes.
+
+        Uses a hinge-style formulation: max(0, target - std(x_d)) so that
+        we only penalise dimensions whose std is *below* the target.
+        """
+        batch_size, num_tokens, embed_dim = embeddings.shape
+        flat = embeddings.reshape(-1, embed_dim).float()
+
+        # Per-dimension std
+        std = flat.std(dim=0)  # (embed_dim,)
+
+        # Hinge: penalise only when std < target
+        var_loss = torch.mean(F.relu(self.variance_target - std))
+        return var_loss
+
+    def covariance_loss_sketched(
+        self,
+        embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the off-diagonal covariance loss in a *sketched* space.
+
+        1. Center the embeddings.
+        2. Project to a lower-dimensional space via random matrix R.
+        3. Compute covariance of the projected embeddings.
+        4. Penalise off-diagonal elements (push toward zero → decorrelation).
+
+        Using sketching reduces complexity from O(d^2) to O(d*k + k^2)
+        where k = sketch_dim << d.
+        """
+        batch_size, num_tokens, embed_dim = embeddings.shape
+        flat = embeddings.reshape(-1, embed_dim).float()
+
+        # Center
+        flat = flat - flat.mean(dim=0, keepdim=True)
+        n = flat.shape[0]
+
+        if self.sketch_dim > 0 and self.sketch_dim < embed_dim:
+            # --- Sketched covariance ---
+            R = self._get_sketch_matrix(embed_dim, embeddings.device)
+            projected = flat @ R  # (n, sketch_dim)
+            k = projected.shape[1]
+            cov = (projected.T @ projected) / max(n - 1, 1)  # (k, k)
+        else:
+            # --- Full covariance (legacy / small embed_dim) ---
+            k = embed_dim
+            cov = (flat.T @ flat) / max(n - 1, 1)  # (d, d)
+
+        # Off-diagonal penalty: zero out diagonal, penalise the rest
+        diag = torch.diagonal(cov)
+        off_diag = cov - torch.diag(diag)
+        cov_loss = (off_diag ** 2).sum() / k
+        return cov_loss
+
     def regularization_loss(
         self,
         embeddings: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Prevent collapse: make sure embeddings are diverse and spread out.
+        Combined regularization: variance + sketched covariance.
 
-        We want the covariance matrix of embeddings to look like an identity matrix.
-        (Identity matrix = each dimension is independent and equally important.)
+        Together they push the embedding distribution toward an isotropic
+        Gaussian (the "IG" in SIGReg).
 
-        If all embeddings were the same, the covariance would be all zeros.
-        By pushing it toward identity, we force diversity.
+        Returns a single scalar combining both terms.
         """
-        batch_size, num_tokens, embed_dim = embeddings.shape
-
-        # Reshape: combine batch and token dimensions
-        flat = embeddings.reshape(-1, embed_dim)
-
-        # Force float32 for numerical stability (float16 overflows at ~65504
-        # and the covariance matrix multiply easily exceeds that with large embed_dim)
-        flat = flat.float()
-
-        # Center the embeddings (subtract mean)
-        flat = flat - flat.mean(dim=0, keepdim=True)
-
-        # Compute covariance matrix
-        # (what correlations exist between embedding dimensions?)
-        n = flat.shape[0]
-        cov = (flat.T @ flat) / max(n - 1, 1)
-
-        # We want cov to be close to the identity matrix
-        # Loss = how far is cov from identity?
-        identity = torch.eye(embed_dim, device=embeddings.device)
-        reg_loss = F.mse_loss(cov, identity)
-
-        return reg_loss
+        var_loss = self.variance_loss(embeddings)
+        cov_loss = self.covariance_loss_sketched(embeddings)
+        return self.lambda_var * var_loss + self.lambda_cov * cov_loss
 
     def forward(
         self,
@@ -114,7 +199,9 @@ class SIGRegLoss(nn.Module):
             Dictionary with total loss and components
         """
         pred_loss = self.prediction_loss(predicted_target, actual_target)
-        reg_loss = self.regularization_loss(all_embeddings)
+        var_loss = self.variance_loss(all_embeddings)
+        cov_loss = self.covariance_loss_sketched(all_embeddings)
+        reg_loss = self.lambda_var * var_loss + self.lambda_cov * cov_loss
 
         total_loss = pred_loss + self.lambda_reg * reg_loss
 
@@ -126,4 +213,6 @@ class SIGRegLoss(nn.Module):
             "total_loss": total_loss,
             "prediction_loss": pred_loss,
             "regularization_loss": reg_loss,
+            "variance_loss": var_loss,
+            "covariance_loss": cov_loss,
         }

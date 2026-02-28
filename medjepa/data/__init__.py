@@ -12,7 +12,7 @@ from medjepa.data.datasets import (
     DECATHLON_TASKS,
 )
 from medjepa.data.dicom_utils import anonymize_dicom, extract_pixel_data, get_dicom_info
-from medjepa.data.masking import PatchMasker2D, PatchMasker3D, TemporalMasker
+from medjepa.data.masking import PatchMasker2D, PatchMasker3D, TemporalMasker, AnatomyAwareMasker
 
 __all__ = [
     "MedicalImagePreprocessor",
@@ -31,4 +31,5 @@ __all__ = [
     "PatchMasker2D",
     "PatchMasker3D",
     "TemporalMasker",
+    "AnatomyAwareMasker",
 ]

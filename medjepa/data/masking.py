@@ -107,6 +107,133 @@ class PatchMasker2D:
         return grid.reshape(self.grid_size, self.grid_size)
 
 
+class AnatomyAwareMasker:
+    """
+    Anatomy-aware masking for medical images.
+
+    Instead of masking purely random regions, this masker biases the target
+    blocks toward *anatomically interesting* areas (high-intensity variance,
+    edges, potential lesion regions).  The context (visible) patches are
+    chosen from less informative areas so the model must *reason* about
+    anatomy to predict the masked targets.
+
+    Strategy:
+      1. Compute a per-patch "saliency" score from the image itself
+         (local intensity variance, edge magnitude, or foreground fraction).
+      2. Sample target blocks with probability proportional to saliency.
+      3. Remaining patches become the context.
+    """
+
+    def __init__(
+        self,
+        image_size: int = 224,
+        patch_size: int = 16,
+        mask_ratio: float = 0.75,
+        saliency_method: str = "variance",
+        # "variance" — local intensity variance per patch
+        # "edge"     — Sobel edge magnitude per patch
+        # "foreground" — fraction of non-zero pixels per patch
+        temperature: float = 2.0,
+        # Controls how strongly saliency biases the sampling.
+        # Higher = more bias toward salient patches.
+    ):
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.grid_size = image_size // patch_size
+        self.num_patches = self.grid_size ** 2
+        self.mask_ratio = mask_ratio
+        self.saliency_method = saliency_method
+        self.temperature = temperature
+
+    def _compute_patch_saliency(
+        self,
+        image: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Compute a saliency score for each patch in the image.
+
+        Args:
+            image: numpy array of shape (H, W) or (H, W, C) with values in [0, 1].
+
+        Returns:
+            saliency: 1D array of shape (num_patches,) with per-patch scores.
+        """
+        # Convert to grayscale if needed
+        if image.ndim == 3:
+            gray = image.mean(axis=-1)
+        else:
+            gray = image
+
+        # Resize to exact image_size for clean grid alignment
+        if gray.shape[0] != self.image_size or gray.shape[1] != self.image_size:
+            from PIL import Image as PILImage
+            pil = PILImage.fromarray((np.clip(gray, 0, 1) * 255).astype(np.uint8))
+            pil = pil.resize((self.image_size, self.image_size), PILImage.LANCZOS)
+            gray = np.array(pil, dtype=np.float32) / 255.0
+
+        saliency = np.zeros(self.num_patches, dtype=np.float32)
+        ps = self.patch_size
+
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                patch = gray[i * ps:(i + 1) * ps, j * ps:(j + 1) * ps]
+                idx = i * self.grid_size + j
+
+                if self.saliency_method == "variance":
+                    saliency[idx] = patch.var()
+                elif self.saliency_method == "edge":
+                    # Simple Sobel approximation using numpy differences
+                    gx = np.diff(patch, axis=1)
+                    gy = np.diff(patch, axis=0)
+                    saliency[idx] = float(np.sqrt(gx ** 2).mean() + np.sqrt(gy ** 2).mean())
+                elif self.saliency_method == "foreground":
+                    # Fraction of pixels above a small threshold (not background)
+                    saliency[idx] = (patch > 0.05).mean()
+                else:
+                    saliency[idx] = 1.0  # uniform fallback
+
+        return saliency
+
+    def generate_mask(
+        self,
+        image: np.ndarray,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate anatomy-aware context and target masks.
+
+        Args:
+            image: numpy array of shape (H, W) or (H, W, C).
+
+        Returns:
+            context_indices, target_indices
+        """
+        saliency = self._compute_patch_saliency(image)
+
+        # Apply temperature and convert to probabilities
+        # Higher temperature → more bias toward salient patches
+        logits = saliency * self.temperature
+        # Softmax-style normalization
+        logits = logits - logits.max()  # numerical stability
+        probs = np.exp(logits)
+        probs = probs / probs.sum()
+
+        num_target = int(self.num_patches * self.mask_ratio)
+
+        # Sample target patches (without replacement) biased by saliency
+        target_indices = np.random.choice(
+            self.num_patches,
+            size=num_target,
+            replace=False,
+            p=probs,
+        )
+        target_indices = np.sort(target_indices)
+
+        all_set = set(range(self.num_patches))
+        context_indices = np.array(sorted(all_set - set(target_indices)))
+
+        return torch.tensor(context_indices), torch.tensor(target_indices)
+
+
 class PatchMasker3D:
     """
     Masking for 3D medical volumes (CT, MRI).
@@ -120,6 +247,8 @@ class PatchMasker3D:
         volume_size: Tuple[int, int, int] = (128, 128, 64),
         patch_size: Tuple[int, int, int] = (16, 16, 8),
         mask_ratio: float = 0.75,
+        num_target_blocks: int = 4,
+        # How many 3D rectangular blocks to mask (for block masking).
     ):
         self.volume_size = volume_size
         self.patch_size = patch_size
@@ -130,6 +259,7 @@ class PatchMasker3D:
             self.grid_size[0] * self.grid_size[1] * self.grid_size[2]
         )
         self.mask_ratio = mask_ratio
+        self.num_target_blocks = num_target_blocks
 
     def generate_mask(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generate random 3D mask."""
@@ -138,6 +268,42 @@ class PatchMasker3D:
 
         context_indices = torch.tensor(sorted(all_indices[num_masked:]))
         target_indices = torch.tensor(sorted(all_indices[:num_masked]))
+
+        return context_indices, target_indices
+
+    def generate_block_mask(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate 3D block-style masking (analogous to 2D block masking).
+
+        Hides contiguous 3D rectangular sub-volumes. This forces the model
+        to understand the 3D spatial structure of anatomy (e.g., if a
+        cuboid covering part of a tumour is masked, the model must infer
+        its content from surrounding tissue).
+        """
+        gH, gW, gD = self.grid_size
+        mask = np.zeros((gH, gW, gD), dtype=bool)
+        total_to_mask = int(self.num_patches * self.mask_ratio)
+
+        for _ in range(self.num_target_blocks):
+            if mask.sum() >= total_to_mask:
+                break
+
+            # Random block dimensions (between 1/4 and 1/2 of each grid dim)
+            bH = np.random.randint(max(gH // 4, 1), max(gH // 2 + 1, 2))
+            bW = np.random.randint(max(gW // 4, 1), max(gW // 2 + 1, 2))
+            bD = np.random.randint(max(gD // 4, 1), max(gD // 2 + 1, 2))
+
+            # Random position (ensuring it fits)
+            top = np.random.randint(0, max(gH - bH + 1, 1))
+            left = np.random.randint(0, max(gW - bW + 1, 1))
+            front = np.random.randint(0, max(gD - bD + 1, 1))
+
+            mask[top:top + bH, left:left + bW, front:front + bD] = True
+
+        # Convert 3D mask to 1D patch indices
+        mask_flat = mask.flatten()
+        target_indices = torch.tensor(np.where(mask_flat)[0])
+        context_indices = torch.tensor(np.where(~mask_flat)[0])
 
         return context_indices, target_indices
 

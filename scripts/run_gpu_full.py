@@ -352,6 +352,9 @@ def run_lejepa_pretraining(args):
         try:
             ds = load_2d_dataset(name, cfg, args.image_size,
                                  with_labels=False, max_samples=args.max_samples)
+            if len(ds) == 0:
+                print(f"  SKIP {name}: loaded but empty (0 images)")
+                continue
             datasets.append(ds)
             dataset_sizes[name] = len(ds)
             dataset_sources[name] = name  # own source
@@ -366,6 +369,9 @@ def run_lejepa_pretraining(args):
         try:
             ds = load_3d_slice_dataset(name, cfg, args.image_size,
                                        with_labels=False, max_samples=args.max_samples)
+            if len(ds) == 0:
+                print(f"  SKIP {name}: loaded but empty (0 slices)")
+                continue
             datasets.append(ds)
             dataset_sizes[name] = len(ds)
             # Group all Decathlon sub-tasks under one "decathlon" source
@@ -375,6 +381,27 @@ def run_lejepa_pretraining(args):
 
     if not datasets:
         print("ERROR: No datasets found! Run 'python scripts/download_data.py' first.")
+        sys.exit(1)
+
+    # Safety net: remove any datasets that ended up with 0 samples
+    empty = [n for n, s in dataset_sizes.items() if s == 0]
+    if empty:
+        print(f"  Removing {len(empty)} empty dataset(s): {empty}")
+        # Rebuild lists without empty datasets (safer than in-place deletion)
+        filtered_datasets = []
+        filtered_sizes = {}
+        filtered_sources = {}
+        for ds, (name, size) in zip(datasets, dataset_sizes.items()):
+            if size > 0:
+                filtered_datasets.append(ds)
+                filtered_sizes[name] = size
+                filtered_sources[name] = dataset_sources[name]
+        datasets = filtered_datasets
+        dataset_sizes = filtered_sizes
+        dataset_sources = filtered_sources
+
+    if not datasets:
+        print("ERROR: All datasets are empty! Check your data directories.")
         sys.exit(1)
 
     combined = ConcatDataset(datasets)
@@ -412,6 +439,8 @@ def run_lejepa_pretraining(args):
         name = names_list[i]
         src = dataset_sources[name]
         ds_size = len(ds)
+        if ds_size == 0:
+            continue
         n_members = source_member_count[src]
         # w = (1/num_sources) * (1/n_members_in_source) * (1/ds_size)
         # → every source equal, every sub-task within that source equal
@@ -492,11 +521,41 @@ def run_vjepa_pretraining(args):
     brats_dir = Path("data/raw/brats")
     brats_list = []
     if brats_dir.exists():
-        for sdir in sorted(brats_dir.iterdir()):
-            if sdir.is_dir() and sdir.name.startswith("BraTS"):
-                flair = sdir / f"{sdir.name}_flair.nii.gz"
-                if flair.exists():
-                    brats_list.append(str(flair))
+        # Auto-extract .tar archives if present
+        import tarfile
+        for tf_path in list(brats_dir.glob("*.tar*")) + list(brats_dir.glob("*.tgz")):
+            marker = tf_path.with_suffix(tf_path.suffix + ".extracted")
+            if not marker.exists():
+                try:
+                    print(f"  Extracting {tf_path.name} ...")
+                    with tarfile.open(str(tf_path), "r:*") as tar:
+                        tar.extractall(path=str(brats_dir))
+                    marker.touch()
+                except Exception as e:
+                    print(f"  WARNING: Failed to extract {tf_path.name}: {e}")
+
+        # Collect subject dirs, looking inside container folders too
+        candidate_dirs = sorted([
+            d for d in brats_dir.iterdir()
+            if d.is_dir() and d.name.startswith("BraTS")
+        ])
+        subject_dirs = []
+        for d in candidate_dirs:
+            flair = d / f"{d.name}_flair.nii.gz"
+            if flair.exists():
+                subject_dirs.append(d)
+            else:
+                # Container folder — look one level deeper
+                nested = sorted([
+                    sd for sd in d.iterdir()
+                    if sd.is_dir() and sd.name.startswith("BraTS")
+                ]) if d.is_dir() else []
+                subject_dirs.extend(nested)
+
+        for sdir in subject_dirs:
+            flair = sdir / f"{sdir.name}_flair.nii.gz"
+            if flair.exists():
+                brats_list.append(str(flair))
     if brats_list:
         source_paths["brats"] = brats_list
         print(f"  BraTS: {len(brats_list)} volumes")
@@ -515,6 +574,20 @@ def run_vjepa_pretraining(args):
                     img_path = task_dir / entry["image"].lstrip("./")
                     if img_path.exists():
                         task_list.append(str(img_path))
+
+                # Fallback: if imagesTr entries are missing, try imagesTs
+                if not task_list:
+                    images_tr = task_dir / "imagesTr"
+                    images_ts = task_dir / "imagesTs"
+                    tr_files = sorted(images_tr.glob("*.nii.gz")) if images_tr.exists() else []
+                    ts_files = sorted(images_ts.glob("*.nii.gz")) if images_ts.exists() else []
+                    if tr_files:
+                        task_list = [str(p) for p in tr_files]
+                    elif ts_files:
+                        print(f"  Decathlon/{task_dir.name}: imagesTr empty, "
+                              f"using {len(ts_files)} volumes from imagesTs/")
+                        task_list = [str(p) for p in ts_files]
+
                 if task_list:
                     decathlon_task_paths[task_dir.name] = task_list
                     print(f"  Decathlon/{task_dir.name}: {len(task_list)} volumes")
