@@ -16,6 +16,10 @@ import torch.nn as nn
 import math
 from typing import Optional
 
+# Enable PyTorch 2.x scaled_dot_product_attention (Flash Attention on A100)
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+
 
 class PatchEmbedding(nn.Module):
     """
@@ -53,6 +57,8 @@ class PatchEmbedding(nn.Module):
         Returns:
             Patch embeddings, shape (batch_size, num_patches, embed_dim)
         """
+        # channels_last memory format: ~10-30% faster Conv2d on A100
+        x = x.contiguous(memory_format=torch.channels_last)
         # x shape: (B, 3, 224, 224) → (B, embed_dim, 14, 14)
         x = self.projection(x)
         # Flatten spatial dimensions: (B, embed_dim, 14, 14) → (B, embed_dim, 196)

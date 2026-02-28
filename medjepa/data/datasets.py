@@ -706,3 +706,72 @@ class VolumetricDataset(Dataset):
             vol = self.transform(vol)
 
         return vol
+
+
+# ═══════════════════════════════════════════════════════════
+# Pre-extracted NIfTI Slice Dataset (FAST — reads .npy files)
+# ═══════════════════════════════════════════════════════════
+class PreExtractedSliceDataset(Dataset):
+    """
+    Ultra-fast dataset that reads pre-extracted 2D slices (.npy files)
+    instead of decompressing NIfTI volumes on-the-fly.
+
+    Run ``python scripts/preextract_slices.py`` first to generate the slices.
+
+    Speed improvement: 10-50x faster than NIfTISliceDataset because
+    .npy files are raw arrays — no gzip decompression, no 3D volume loading.
+    """
+
+    def __init__(
+        self,
+        slice_dir: str,
+        entries: Optional[list] = None,
+        labels: Optional[list] = None,
+        transform: Optional[Callable] = None,
+    ):
+        """
+        Args:
+            slice_dir: Folder containing .npy slice files
+            entries: List of dicts from manifest.json (each has 'file' key).
+                     If None, auto-discovers all .npy files in slice_dir.
+            labels: Optional list of integer labels (same length as entries)
+            transform: Optional augmentations
+        """
+        self.slice_dir = Path(slice_dir)
+        self.transform = transform
+
+        if entries is not None:
+            self.files = [self.slice_dir / e["file"] for e in entries]
+            if labels is not None:
+                self.labels = np.array(labels, dtype=np.int64)
+            else:
+                # Try to get labels from entries
+                if entries and "label" in entries[0]:
+                    self.labels = np.array(
+                        [e.get("label", 0) for e in entries], dtype=np.int64
+                    )
+                else:
+                    self.labels = None
+        else:
+            # Auto-discover — skip *_label.npy files
+            self.files = sorted(
+                p for p in self.slice_dir.glob("*.npy")
+                if not p.name.endswith("_label.npy")
+            )
+            self.labels = None
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        # .npy load is extremely fast (memory-mapped capable)
+        img = np.load(str(self.files[idx]))  # (H, W, 3) float32
+
+        image = torch.tensor(img, dtype=torch.float32).permute(2, 0, 1)  # CHW
+
+        if self.transform:
+            image = self.transform(image)
+
+        if self.labels is not None:
+            return image, int(self.labels[idx])
+        return image

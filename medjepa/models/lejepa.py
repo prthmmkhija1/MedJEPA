@@ -101,7 +101,7 @@ class LeJEPA(nn.Module):
         context_indices = context_indices.to(images.device)
         target_indices = target_indices.to(images.device)
 
-        # Step 2: Encode ALL patches (we need both context and target embeddings)
+        # Step 2: Encode ALL patches (full context for both context and target)
         all_embeddings = self.encoder(images)
 
         # Step 3: Extract context and target embeddings

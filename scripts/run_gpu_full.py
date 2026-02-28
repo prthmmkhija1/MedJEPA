@@ -57,6 +57,7 @@ from medjepa.data.datasets import (
     ChestXray14Dataset,
     BraTSDataset,
     DecathlonDataset,
+    PreExtractedSliceDataset,
     VolumetricDataset,
 )
 from medjepa.training.trainer import MedJEPATrainer
@@ -171,6 +172,8 @@ def parse_args():
     # Training
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                   help="Accumulate gradients over N mini-batches (effective batch = batch_size * N)")
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--warmup_epochs", type=int, default=None)
     p.add_argument("--num_workers", type=int, default=None)
@@ -235,8 +238,8 @@ def parse_args():
         "encoder_depth": 12, "predictor_depth": 6, "mask_ratio": 0.75,
         "lambda_reg": 1.0, "volume_size": [128, 128, 64],
         "vjepa_epochs": 50, "vjepa_batch_size": 4,
-        "epochs": 100, "batch_size": 64, "lr": 1e-3,
-        "warmup_epochs": 10, "num_workers": 4,
+        "epochs": 100, "batch_size": 128, "lr": 1.4e-3,
+        "warmup_epochs": 10, "num_workers": 8,
         "checkpoint_dir": "checkpoints", "results_dir": "results",
         "log_every": 10, "save_every": 5,
     }
@@ -294,12 +297,58 @@ def load_2d_dataset(name: str, cfg: dict, image_size: int,
     return ds
 
 
+# Pre-extracted slices base directory
+PREEXTRACTED_BASE = Path("data/processed/nifti_slices")
+
+
+def _find_preextracted_dir(name: str, ds_type: str, cfg: dict):
+    """Return Path to pre-extracted slice folder, or None if not available."""
+    if not PREEXTRACTED_BASE.exists():
+        return None
+    if ds_type == "brats":
+        d = PREEXTRACTED_BASE / "brats"
+    elif ds_type == "decathlon":
+        task_name = cfg.get("task_name", "")
+        d = PREEXTRACTED_BASE / f"decathlon_{task_name}"
+    else:
+        return None
+    if d.exists() and any(d.glob("*.npy")):
+        return d
+    return None
+
+
 def load_3d_slice_dataset(name: str, cfg: dict, image_size: int,
                           with_labels: bool, max_samples=None):
-    """Load a 3D dataset as 2D slices for LeJEPA pre-training."""
+    """Load a 3D dataset as 2D slices for LeJEPA pre-training.
+
+    Automatically uses pre-extracted .npy slices when available
+    (10-50x faster than on-the-fly NIfTI decompression).
+    """
     ds_type = cfg["type"]
     slices = cfg.get("slices_per_volume", 10)
 
+    # ── Fast path: use pre-extracted slices if they exist ──
+    pre_dir = _find_preextracted_dir(name, ds_type, cfg)
+    if pre_dir is not None:
+        manifest_path = pre_dir.parent / "manifest.json"
+        entries = None
+        if manifest_path.exists():
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            # Lookup key: "brats" or "decathlon_Task02_Heart"
+            key = name  # e.g. "decathlon_Task02_Heart" or "brats"
+            entries = manifest.get(key)
+        ds = PreExtractedSliceDataset(
+            slice_dir=str(pre_dir),
+            entries=entries,
+            transform=None,
+        )
+        if len(ds) > 0:
+            print(f"  {name}: {len(ds)} PRE-EXTRACTED slices (fast path)")
+            return ds
+        # Fallback to original if pre-extracted dir is empty
+
+    # ── Slow path: on-the-fly NIfTI loading ──
     if ds_type == "brats":
         ds = BraTSDataset(
             data_dir=cfg["data_dir"],
@@ -488,6 +537,8 @@ def run_lejepa_pretraining(args):
         "mixed_precision": torch.cuda.is_available(),
         "use_tensorboard": not getattr(args, "no_tensorboard", False),
         "use_weighted_sampler": True,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "compile_model": True,
     }
 
     # Train

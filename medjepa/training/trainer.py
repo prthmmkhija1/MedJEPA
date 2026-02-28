@@ -99,6 +99,14 @@ class MedJEPATrainer:
         self.local_rank = config.get("local_rank", 0)
         self.world_size = config.get("world_size", 1)
 
+        # ---------- CUDA performance flags ----------
+        if torch.cuda.is_available():
+            # Auto-tune convolution algorithms for fixed input sizes
+            torch.backends.cudnn.benchmark = True
+            # TF32 on A100/Ampere: ~2x matmul throughput with negligible precision loss
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
         if self.distributed:
             self.device = torch.device(f"cuda:{self.local_rank}")
             self.model = self.model.to(self.device)
@@ -123,15 +131,26 @@ class MedJEPATrainer:
             if sampler is None:
                 sampler = self._build_sampler(train_dataset, config)
 
+        # ---------- torch.compile for faster forward/backward ----------
+        if config.get("compile_model", True) and hasattr(torch, "compile"):
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                print("  torch.compile enabled (reduce-overhead mode)")
+            except Exception as e:
+                print(f"  torch.compile unavailable: {e}")
+
         # DataLoader: feeds batches of images to the model
+        _nw = config.get("num_workers", 0)
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.get("batch_size", 32),
             shuffle=(sampler is None),  # shuffle only when no sampler
             sampler=sampler,
-            num_workers=config.get("num_workers", 0),
+            num_workers=_nw,
             pin_memory=torch.cuda.is_available(),
             drop_last=True,     # Drop incomplete last batch
+            persistent_workers=(_nw > 0),   # keep workers alive between epochs
+            prefetch_factor=3 if _nw > 0 else None,  # pre-load next batches
         )
 
         if val_dataset:
@@ -139,44 +158,66 @@ class MedJEPATrainer:
                 val_dataset,
                 batch_size=config.get("batch_size", 32),
                 shuffle=False,
-                num_workers=config.get("num_workers", 0),
+                num_workers=_nw,
+                pin_memory=torch.cuda.is_available(),
+                persistent_workers=(_nw > 0),
+                prefetch_factor=3 if _nw > 0 else None,
             )
         else:
             self.val_loader = None
 
         # Optimizer: the algorithm that updates model weights
-        # AdamW is the standard choice for Transformers
+        # Fused AdamW merges multiple CUDA kernels → fewer launches → faster
+        _use_fused = torch.cuda.is_available() and hasattr(torch.optim.AdamW, 'fused')
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config.get("learning_rate", 1e-3),
             weight_decay=config.get("weight_decay", 0.05),
             betas=(0.9, 0.999),
+            fused=_use_fused,
         )
 
         # Learning rate scheduler:
-        # Cosine annealing *with linear warmup*.
-        # Warmup ramps the LR up from ~0 to peak over the first N epochs,
-        # then cosine-decays for the rest.  This stabilises early training.
+        # OneCycleLR: peaks early and decays — 2-3x faster convergence than
+        # warmup+cosine for self-supervised ViT training.
+        # Falls back to warmup+cosine if total_steps can't be computed.
         self.warmup_epochs = config.get("warmup_epochs", 10)
         num_epochs = config.get("num_epochs", 100)
-        cosine_epochs = max(num_epochs - self.warmup_epochs, 1)
+        _use_onecycle = config.get("use_onecycle_lr", True)
 
-        self.cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=cosine_epochs,
-            eta_min=1e-6,
-        )
-        self.warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            self.optimizer,
-            start_factor=1e-4,
-            end_factor=1.0,
-            total_iters=max(self.warmup_epochs, 1),
-        )
-        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-            self.optimizer,
-            schedulers=[self.warmup_scheduler, self.cosine_scheduler],
-            milestones=[self.warmup_epochs],
-        )
+        try:
+            if _use_onecycle and hasattr(train_dataset, '__len__'):
+                _bs = config.get("batch_size", 32)
+                _accum = config.get("gradient_accumulation_steps", 1)
+                steps_per_epoch = max(len(train_dataset) // (_bs * _accum), 1)
+                total_steps = num_epochs * steps_per_epoch
+                self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                    self.optimizer,
+                    max_lr=config.get("learning_rate", 1e-3),
+                    total_steps=total_steps,
+                    pct_start=self.warmup_epochs / max(num_epochs, 1),
+                    anneal_strategy="cos",
+                    div_factor=25.0,      # start_lr = max_lr / 25
+                    final_div_factor=1e4, # end_lr  = max_lr / 1e4
+                )
+                self._scheduler_step_per_batch = True
+                print(f"  OneCycleLR: {total_steps} total steps, "
+                      f"max_lr={config.get('learning_rate', 1e-3):.4f}")
+            else:
+                raise ValueError("fallback")
+        except Exception:
+            # Fallback: warmup + cosine
+            cosine_epochs = max(num_epochs - self.warmup_epochs, 1)
+            self.cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=cosine_epochs, eta_min=1e-6)
+            self.warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer, start_factor=1e-4, end_factor=1.0,
+                total_iters=max(self.warmup_epochs, 1))
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[self.warmup_scheduler, self.cosine_scheduler],
+                milestones=[self.warmup_epochs])
+            self._scheduler_step_per_batch = False
 
         # Mixed precision training (saves GPU memory)
         self.use_amp = config.get("mixed_precision", False) and torch.cuda.is_available()
@@ -195,6 +236,8 @@ class MedJEPATrainer:
             print(f"  TensorBoard logging -> {log_dir}")
 
         self._global_step = 0
+        self._grad_accum_steps = config.get("gradient_accumulation_steps", 1)
+        self._tb_log_every = config.get("tb_log_every", 50)  # reduce GPU syncs
 
     # ------------------------------------------------------------------
     # WeightedRandomSampler: handles class-imbalanced medical datasets
@@ -271,44 +314,55 @@ class MedJEPATrainer:
             else:
                 images = batch
 
-            images = images.to(self.device)
+            images = images.to(self.device, non_blocking=True)
 
-            # Zero gradients BEFORE forward pass
-            self.optimizer.zero_grad()
+            # Zero gradients (set_to_none is faster than filling with zeros)
+            if batch_idx % self._grad_accum_steps == 0:
+                self.optimizer.zero_grad(set_to_none=True)
 
             # Forward pass (with optional mixed precision)
             if self.use_amp:
                 with torch.amp.autocast("cuda"):
                     losses = self.model(images)
-                    loss = losses["total_loss"]
+                    loss = losses["total_loss"] / self._grad_accum_steps
 
                 # Backward pass with scaling
                 self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                if (batch_idx + 1) % self._grad_accum_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
             else:
                 losses = self.model(images)
-                loss = losses["total_loss"]
+                loss = losses["total_loss"] / self._grad_accum_steps
 
                 # Backward pass
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
+                if (batch_idx + 1) % self._grad_accum_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
 
-            # Skip inf/nan batches in accumulation (numerical stability)
-            loss_val = loss.item()
-            if not (loss_val != loss_val or loss_val == float('inf')):
-                total_loss += loss_val
+            # Track loss (avoid .item() sync on every step when possible)
+            with torch.no_grad():
+                loss_val = (loss * self._grad_accum_steps).detach()
+            if torch.isfinite(loss_val):
+                total_loss += loss_val.item()
                 num_batches += 1
 
             self._global_step += 1
 
-            # TensorBoard per-step logging
-            if self.tb_writer is not None and num_batches > 0:
+            # OneCycleLR steps per batch; epoch-level schedulers step at epoch end
+            if getattr(self, '_scheduler_step_per_batch', False):
+                if (batch_idx + 1) % self._grad_accum_steps == 0:
+                    self.scheduler.step()
+
+            # TensorBoard per-step logging (throttled to reduce GPU sync overhead)
+            if (self.tb_writer is not None and num_batches > 0
+                    and self._global_step % self._tb_log_every == 0):
+                lv = loss_val.item() if torch.is_tensor(loss_val) else loss_val
                 self.tb_writer.add_scalar(
-                    "train/loss_step", loss_val, self._global_step)
+                    "train/loss_step", lv, self._global_step)
                 self.tb_writer.add_scalar(
                     "train/pred_loss_step",
                     losses["prediction_loss"].item(), self._global_step)
@@ -316,29 +370,32 @@ class MedJEPATrainer:
                     "train/reg_loss_step",
                     losses["regularization_loss"].item(), self._global_step)
 
-            # Update tqdm postfix or print progress
-            avg_loss = total_loss / max(num_batches, 1)
-            if tqdm is not None and hasattr(loader, 'set_postfix'):
-                loader.set_postfix(
-                    loss=f"{avg_loss:.4f}",
-                    pred=f"{losses['prediction_loss'].item():.4f}",
-                    reg=f"{losses['regularization_loss'].item():.4f}",
-                )
-            else:
-                log_every = self.config.get("log_every", 50)
-                if (batch_idx + 1) % log_every == 0:
+            # Update tqdm postfix or print progress (throttled to avoid GPU sync)
+            log_every = self.config.get("log_every", 50)
+            if (batch_idx + 1) % log_every == 0:
+                avg_loss = total_loss / max(num_batches, 1)
+                pred_val = losses["prediction_loss"].item()
+                reg_val = losses["regularization_loss"].item()
+                if tqdm is not None and hasattr(loader, 'set_postfix'):
+                    loader.set_postfix(
+                        loss=f"{avg_loss:.4f}",
+                        pred=f"{pred_val:.4f}",
+                        reg=f"{reg_val:.4f}",
+                    )
+                else:
                     elapsed = time.time() - start_time
                     print(
                         f"  Epoch {epoch+1} | "
                         f"Batch {batch_idx+1}/{len(self.train_loader)} | "
                         f"Loss: {avg_loss:.4f} | "
-                        f"Pred Loss: {losses['prediction_loss'].item():.4f} | "
-                        f"Reg Loss: {losses['regularization_loss'].item():.4f} | "
+                        f"Pred Loss: {pred_val:.4f} | "
+                        f"Reg Loss: {reg_val:.4f} | "
                         f"Time: {elapsed:.1f}s"
                     )
 
-        # Step the learning rate scheduler
-        self.scheduler.step()
+        # Step epoch-level scheduler (skip for OneCycleLR which steps per batch)
+        if not getattr(self, '_scheduler_step_per_batch', False):
+            self.scheduler.step()
 
         avg_loss = total_loss / max(num_batches, 1)
         return avg_loss

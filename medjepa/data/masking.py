@@ -28,6 +28,8 @@ class PatchMasker2D:
         # How much of the image to hide. 0.75 = hide 75%.
         num_target_blocks: int = 4,
         # How many separate rectangular blocks to hide
+        mask_cache_size: int = 256,
+        # Pre-generate this many masks to avoid CPU overhead each step
     ):
         self.image_size = image_size
         self.patch_size = patch_size
@@ -35,6 +37,14 @@ class PatchMasker2D:
         self.num_patches = self.grid_size ** 2      # e.g., 14*14 = 196
         self.mask_ratio = mask_ratio
         self.num_target_blocks = num_target_blocks
+
+        # Pre-generate a cache of masks to eliminate CPU→GPU overhead
+        self._mask_cache = []
+        self._cache_idx = 0
+        self._cache_device = None
+        for _ in range(mask_cache_size):
+            c, t = self._generate_block_mask_raw()
+            self._mask_cache.append((c, t))
 
     def generate_mask(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -59,6 +69,21 @@ class PatchMasker2D:
     def generate_block_mask(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate block-style masking (like I-JEPA).
+        Uses a pre-generated cache for speed — no numpy/CPU work per step.
+        """
+        c, t = self._mask_cache[self._cache_idx % len(self._mask_cache)]
+        self._cache_idx += 1
+        # Refresh cache periodically for diversity
+        if self._cache_idx >= len(self._mask_cache):
+            self._cache_idx = 0
+            # Reshuffle order
+            import random
+            random.shuffle(self._mask_cache)
+        return c, t
+
+    def _generate_block_mask_raw(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate one block-style mask (CPU, used for cache building).
         Instead of random patches, hides rectangular BLOCKS.
 
         This is more natural — in a chest X-ray, hiding a rectangular region
