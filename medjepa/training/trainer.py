@@ -175,13 +175,17 @@ class MedJEPATrainer:
                 sampler = self._build_sampler(train_dataset, config)
 
         # ---------- torch.compile for faster forward/backward ----------
-        # Use "max-autotune" instead of "reduce-overhead" because the latter
-        # uses CUDA graphs which crash on dynamic tensors (random sketch
-        # matrices, CPU-originated mask indices, etc.).
+        # Disable CUDA graphs (triton.cudagraphs=False) — they crash on any
+        # dynamic tensor inside the graph (random sketch matrix, variable-size
+        # mask indices, etc.).  All Triton kernel auto-tuning still applies.
         if config.get("compile_model", True) and hasattr(torch, "compile"):
             try:
-                self.model = torch.compile(self.model, mode="max-autotune")
-                print("  torch.compile enabled (max-autotune mode)")
+                self.model = torch.compile(
+                    self.model,
+                    mode="max-autotune",
+                    options={"triton.cudagraphs": False},
+                )
+                print("  torch.compile enabled (max-autotune, no cudagraphs)")
             except Exception as e:
                 print(f"  torch.compile unavailable: {e}")
 
@@ -363,6 +367,11 @@ class MedJEPATrainer:
                 images = batch
 
             images = images.to(self.device, non_blocking=True)
+
+            # Signal start of a new step — needed when CUDA graphs are active
+            # (no-op when cudagraphs disabled, but harmless to keep)
+            if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
 
             # Zero gradients (set_to_none is faster than filling with zeros)
             if batch_idx % self._grad_accum_steps == 0:
