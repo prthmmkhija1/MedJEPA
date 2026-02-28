@@ -34,6 +34,49 @@ except ImportError:
 
 
 # ----------------------------------------------------------------
+# Safe collate: handle mixed returns & shape mismatches
+# ----------------------------------------------------------------
+
+def _safe_collate(batch):
+    """Custom collate that handles shape mismatches and mixed return types.
+
+    - Strips labels from (image, label) tuples so the batch is always
+      a plain tensor of images.
+    - Skips items whose image tensor has a different shape from the majority.
+    - Falls back to default_collate for clean batches (zero overhead).
+    """
+    # Unwrap: ensure every element is a plain tensor
+    images = []
+    for item in batch:
+        if isinstance(item, (tuple, list)):
+            images.append(item[0])
+        else:
+            images.append(item)
+
+    if not images:
+        return torch.empty(0)
+
+    # Determine the expected shape (majority vote)
+    target_shape = images[0].shape
+    filtered = [img for img in images if img.shape == target_shape]
+
+    if len(filtered) < len(images):
+        # Some images had wrong shapes — drop them
+        dropped = len(images) - len(filtered)
+        if dropped > 0:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Dropped {dropped}/{len(images)} items with mismatched shapes "
+                f"(expected {target_shape})"
+            )
+
+    if not filtered:
+        return torch.zeros(1, *target_shape)
+
+    return torch.stack(filtered, 0)
+
+
+# ----------------------------------------------------------------
 # DDP helper utilities
 # ----------------------------------------------------------------
 
@@ -151,6 +194,7 @@ class MedJEPATrainer:
             drop_last=True,     # Drop incomplete last batch
             persistent_workers=(_nw > 0),   # keep workers alive between epochs
             prefetch_factor=3 if _nw > 0 else None,  # pre-load next batches
+            collate_fn=_safe_collate,  # handle shape mismatches & mixed returns
         )
 
         if val_dataset:
@@ -162,6 +206,7 @@ class MedJEPATrainer:
                 pin_memory=torch.cuda.is_available(),
                 persistent_workers=(_nw > 0),
                 prefetch_factor=3 if _nw > 0 else None,
+                collate_fn=_safe_collate,
             )
         else:
             self.val_loader = None

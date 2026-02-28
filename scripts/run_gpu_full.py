@@ -341,6 +341,7 @@ def load_3d_slice_dataset(name: str, cfg: dict, image_size: int,
         ds = PreExtractedSliceDataset(
             slice_dir=str(pre_dir),
             entries=entries,
+            with_labels=with_labels,
             transform=None,
         )
         if len(ds) > 0:

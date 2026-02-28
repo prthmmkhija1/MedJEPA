@@ -21,6 +21,34 @@ from typing import Optional, List, Callable, Tuple
 from medjepa.data.preprocessing import MedicalImagePreprocessor
 
 
+def _enforce_image_shape(tensor: torch.Tensor, target_h: int = 224, target_w: int = 224) -> torch.Tensor:
+    """
+    Ensure tensor is exactly (3, target_h, target_w).
+    Handles edge cases: wrong spatial size, wrong channels, extra dims.
+    """
+    # Squeeze any extra leading dims  (1, 3, H, W) → (3, H, W)
+    while tensor.ndim > 3:
+        tensor = tensor.squeeze(0)
+    # If 2-D (H, W), expand to 3 channels
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0).expand(3, -1, -1)
+    c, h, w = tensor.shape
+    # Fix channel count
+    if c == 1:
+        tensor = tensor.expand(3, -1, -1)
+    elif c == 4:
+        tensor = tensor[:3]
+    elif c != 3:
+        tensor = tensor[:1].expand(3, -1, -1)
+    # Fix spatial dims
+    if h != target_h or w != target_w:
+        tensor = torch.nn.functional.interpolate(
+            tensor.unsqueeze(0), size=(target_h, target_w),
+            mode="bilinear", align_corners=False,
+        ).squeeze(0)
+    return tensor.contiguous()
+
+
 class MedicalImageDataset(Dataset):
     """
     A general dataset class for 2D medical images.
@@ -115,6 +143,7 @@ class MedicalImageDataset(Dataset):
         # "Numpy is not available" errors in DataLoader worker processes
         # (a known issue with NumPy 2.x + PyTorch multiprocessing).
         image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)  # HWC → CHW
+        image = _enforce_image_shape(image, *self.target_size)
 
         if self.transform:
             image = self.transform(image)
@@ -246,6 +275,7 @@ class ChestXray14Dataset(Dataset):
             image = self.preprocessor.preprocess(str(image_path))
 
         image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
+        image = _enforce_image_shape(image, *self.target_size)
 
         if self.transform:
             image = self.transform(image)
@@ -396,6 +426,7 @@ class NIfTISliceDataset(Dataset):
         # Grayscale → 3 channels (model expects 3ch)
         image = np.stack([slc, slc, slc], axis=-1)
         image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)  # HWC → CHW
+        image = _enforce_image_shape(image, *self.target_size)
 
         if self.transform:
             image = self.transform(image)
@@ -727,6 +758,7 @@ class PreExtractedSliceDataset(Dataset):
         slice_dir: str,
         entries: Optional[list] = None,
         labels: Optional[list] = None,
+        with_labels: bool = True,
         transform: Optional[Callable] = None,
     ):
         """
@@ -735,6 +767,7 @@ class PreExtractedSliceDataset(Dataset):
             entries: List of dicts from manifest.json (each has 'file' key).
                      If None, auto-discovers all .npy files in slice_dir.
             labels: Optional list of integer labels (same length as entries)
+            with_labels: If False, always return images only (no labels)
             transform: Optional augmentations
         """
         self.slice_dir = Path(slice_dir)
@@ -742,7 +775,9 @@ class PreExtractedSliceDataset(Dataset):
 
         if entries is not None:
             self.files = [self.slice_dir / e["file"] for e in entries]
-            if labels is not None:
+            if not with_labels:
+                self.labels = None
+            elif labels is not None:
                 self.labels = np.array(labels, dtype=np.int64)
             else:
                 # Try to get labels from entries
@@ -768,6 +803,7 @@ class PreExtractedSliceDataset(Dataset):
         img = np.load(str(self.files[idx]))  # (H, W, 3) float32
 
         image = torch.tensor(img, dtype=torch.float32).permute(2, 0, 1)  # CHW
+        image = _enforce_image_shape(image)
 
         if self.transform:
             image = self.transform(image)
