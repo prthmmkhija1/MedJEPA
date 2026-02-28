@@ -198,7 +198,7 @@ class MedicalImagePreprocessor:
             ready for model input.
         """
         image = self.preprocess(path)  # (H, W, 3) numpy
-        return torch.from_numpy(image).permute(2, 0, 1)  # (3, H, W) tensor
+        return torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)  # (3, H, W) tensor
 
 
 class VolumetricPreprocessor:

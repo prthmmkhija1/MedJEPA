@@ -1171,12 +1171,12 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                     msk_bin = (msk > 0).astype(np.uint8)
                     pil_msk = PILImage.fromarray(msk_bin * 255)
                     pil_msk = pil_msk.resize(sz, PILImage.NEAREST)
-                    msk_t = torch.from_numpy(
+                    msk_t = torch.tensor(
                         (np.array(pil_msk) > 127).astype(np.int64)
                     )
 
                     image = np.stack([slc, slc, slc], axis=-1)
-                    image = torch.from_numpy(image).permute(2, 0, 1)
+                    image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
                     return image, msk_t
 
             seg_ds = _BraTSSegSliceDataset(
@@ -1316,11 +1316,11 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                     msk_bin = (msk > 0).astype(np.uint8)
                     pil_msk = PILImage.fromarray(msk_bin * 255)
                     pil_msk = pil_msk.resize(sz, PILImage.NEAREST)
-                    msk_t = torch.from_numpy(
+                    msk_t = torch.tensor(
                         (np.array(pil_msk) > 127).astype(np.int64))
 
                     image = np.stack([slc, slc, slc], axis=-1)
-                    image = torch.from_numpy(image).permute(2, 0, 1)
+                    image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
                     return image, msk_t
 
             deca_seg_ds = _DecaSegSliceDataset(

@@ -111,7 +111,10 @@ class MedicalImageDataset(Dataset):
 
         # Convert to PyTorch tensor
         # PyTorch expects shape (channels, height, width), not (height, width, channels)
-        image = torch.from_numpy(image).permute(2, 0, 1)  # HWC → CHW
+        # Use torch.tensor() instead of torch.from_numpy() to avoid
+        # "Numpy is not available" errors in DataLoader worker processes
+        # (a known issue with NumPy 2.x + PyTorch multiprocessing).
+        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)  # HWC → CHW
 
         if self.transform:
             image = self.transform(image)
@@ -153,16 +156,45 @@ class ChestXray14Dataset(Dataset):
         max_samples: Optional[int] = None,
     ):
         self.data_dir = Path(data_dir)
-        self.image_dir = self.data_dir / "images"
         self.target_size = target_size
         self.with_labels = with_labels
         self.transform = transform
         self.preprocessor = MedicalImagePreprocessor(target_size=target_size)
 
-        # Read metadata CSV
-        csv_path = self.data_dir / "Data_Entry_2017_v2020.csv"
-        if not csv_path.exists():
-            raise FileNotFoundError(f"ChestXray14 CSV not found: {csv_path}")
+        # Resolve image directory — try common subdirectory names
+        self.image_dir = self.data_dir / "images"
+        if not self.image_dir.exists():
+            # Kaggle download may place images in different subdirs
+            for candidate in ["CXR8", "images_001", "all_images", "train", "."]:
+                cand_dir = self.data_dir / candidate
+                if cand_dir.exists() and any(cand_dir.rglob("*.png")):
+                    self.image_dir = cand_dir
+                    break
+
+        # Read metadata CSV — try several known filenames
+        csv_candidates = [
+            "Data_Entry_2017_v2020.csv",
+            "Data_Entry_2017.csv",
+            "data_entry_2017_v2020.csv",
+            "data_entry.csv",
+        ]
+        csv_path = None
+        for cname in csv_candidates:
+            p = self.data_dir / cname
+            if p.exists():
+                csv_path = p
+                break
+        # Fallback: pick any CSV in the directory
+        if csv_path is None:
+            all_csvs = list(self.data_dir.glob("*.csv"))
+            if all_csvs:
+                csv_path = all_csvs[0]
+        if csv_path is None:
+            raise FileNotFoundError(
+                f"ChestXray14 CSV not found in {self.data_dir}. "
+                f"Looked for: {csv_candidates}. "
+                f"No .csv files found in the directory."
+            )
 
         self.metadata = pd.read_csv(csv_path)
 
@@ -213,7 +245,7 @@ class ChestXray14Dataset(Dataset):
         else:
             image = self.preprocessor.preprocess(str(image_path))
 
-        image = torch.from_numpy(image).permute(2, 0, 1)
+        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
 
         if self.transform:
             image = self.transform(image)
@@ -345,7 +377,7 @@ class NIfTISliceDataset(Dataset):
 
         # Grayscale → 3 channels (model expects 3ch)
         image = np.stack([slc, slc, slc], axis=-1)
-        image = torch.from_numpy(image).permute(2, 0, 1)  # HWC → CHW
+        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)  # HWC → CHW
 
         if self.transform:
             image = self.transform(image)
@@ -641,7 +673,7 @@ class VolumetricDataset(Dataset):
         vol = zoom(vol, zoom_factors, order=1)
 
         # Add channel dim: (D, H, W) → (1, D, H, W)
-        vol = torch.from_numpy(vol).unsqueeze(0)
+        vol = torch.tensor(vol, dtype=torch.float32).unsqueeze(0)
 
         if self.transform:
             vol = self.transform(vol)
