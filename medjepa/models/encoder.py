@@ -205,3 +205,45 @@ class ViTEncoder(nn.Module):
         # Final normalization
         x = self.norm(x)
         return x
+
+    def patch_embed_only(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Run ONLY the patch embedding conv2d (no positional enc, no transformer).
+        Returns all patch embeddings: shape (batch, num_patches, embed_dim).
+        Call this once and share the result between context and target paths
+        to avoid running the conv2d twice per step.
+        """
+        x = x.contiguous(memory_format=torch.channels_last)
+        x = self.patch_embed.projection(x)   # (B, embed_dim, H, W)
+        x = x.flatten(2).transpose(1, 2)     # (B, num_patches, embed_dim)
+        return x
+
+    def forward_from_embeds(
+        self,
+        all_patch_embeds: torch.Tensor,
+        patch_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Run the positional encoding + transformer blocks on pre-computed
+        patch embeddings from ``patch_embed_only()``.
+
+        Args:
+            all_patch_embeds: (batch, num_patches, embed_dim) — output of
+                              ``patch_embed_only()``.
+            patch_indices:    Which patches to select. None = all patches.
+
+        Returns:
+            Encodings: (batch, len(patch_indices) or num_patches, embed_dim)
+        """
+        if patch_indices is not None:
+            x = all_patch_embeds[:, patch_indices, :] + self.pos_embed[:, patch_indices, :]
+        else:
+            x = all_patch_embeds + self.pos_embed
+
+        for block in self.blocks:
+            if self.use_checkpoint and self.training:
+                x = grad_checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+
+        return self.norm(x)

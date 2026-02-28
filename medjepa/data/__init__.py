@@ -9,6 +9,7 @@ from medjepa.data.datasets import (
     DecathlonDataset,
     PreExtractedSliceDataset,
     VolumetricDataset,
+    RamCachedDataset,
     CHESTXRAY14_DISEASES,
     DECATHLON_TASKS,
 )

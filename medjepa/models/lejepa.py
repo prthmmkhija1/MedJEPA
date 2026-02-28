@@ -121,21 +121,28 @@ class LeJEPA(nn.Module):
 
         if self.split_encoding:
             # ── Split encoding (fast path) ──────────────────────────────
-            # Context: encode only visible patches WITH gradients
-            context_embeddings = self.encoder(images, patch_indices=context_indices)
+            # Run the patch embedding conv2d ONCE for all 196 patches,
+            # then fork: context path gets grad, target path gets no_grad.
+            # This saves one full conv2d pass compared to calling encoder()
+            # twice with different patch_indices.
+            all_patch_embeds = self.encoder.patch_embed_only(images)
 
-            # Target: encode only target patches WITHOUT gradients
-            # (targets are always detached in the loss anyway, so we skip
-            #  the backward graph entirely → large memory + compute saving)
+            # Context: positional enc + transformer on ~49 patches WITH gradients
+            context_embeddings = self.encoder.forward_from_embeds(
+                all_patch_embeds, patch_indices=context_indices
+            )
+
+            # Target: positional enc + transformer on ~147 patches WITHOUT gradients
+            # (targets are always detached in the loss anyway)
             with torch.no_grad():
-                target_embeddings = self.encoder(images, patch_indices=target_indices)
+                target_embeddings = self.encoder.forward_from_embeds(
+                    all_patch_embeds.detach(), patch_indices=target_indices
+                )
 
             # Use context embeddings for SIGReg regularization
-            # (these are the representations being trained)
             reg_embeddings = context_embeddings
         else:
             # ── Full encoding (legacy path) ─────────────────────────────
-            # Encode ALL patches, then slice out context and target
             all_embeddings = self.encoder(images)
             context_embeddings = all_embeddings[:, context_indices, :]
             target_embeddings = all_embeddings[:, target_indices, :]

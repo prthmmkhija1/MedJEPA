@@ -59,6 +59,7 @@ from medjepa.data.datasets import (
     DecathlonDataset,
     PreExtractedSliceDataset,
     VolumetricDataset,
+    RamCachedDataset,
 )
 from medjepa.training.trainer import MedJEPATrainer
 from medjepa.evaluation.linear_probe import LinearProbeEvaluator
@@ -196,6 +197,14 @@ def parse_args():
     p.add_argument("--save_every", type=int, default=None)
     p.add_argument("--no_tensorboard", action="store_true",
                    help="Disable TensorBoard logging")
+    p.add_argument("--cache_dataset", action="store_true",
+                   help="Cache entire dataset in RAM after first epoch (zero I/O for epoch 2+)")
+    p.add_argument("--cache_gb", type=float, default=8.0,
+                   help="Max RAM (GiB) to use for dataset cache (default: 8.0)")
+    p.add_argument("--no_split_encoding", action="store_true",
+                   help="Disable split encoding (run full encoder, slower)")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="Enable gradient checkpointing (saves memory, ~33%% slower)") 
     # Performance optimizations
     p.add_argument("--no_split_encoding", action="store_true",
                    help="Disable split encoding (encode all patches together, slower)")
@@ -510,6 +519,12 @@ def run_lejepa_pretraining(args):
         replacement=True,
     )
     print(f"  Balanced sampler ready — {num_sources} sources, {len(combined)} total samples")
+
+    # Optionally wrap with RAM cache (eliminates all disk I/O from epoch 2 onward)
+    if getattr(args, 'cache_dataset', False):
+        print(f"  Wrapping dataset in RamCachedDataset (max {args.cache_gb:.1f} GB)...")
+        combined = RamCachedDataset(combined, max_gb=args.cache_gb, verbose=True)
+        print("  RAM cache ready.")
 
     # Build LeJEPA model
     _split_encoding = not getattr(args, "no_split_encoding", False)

@@ -5,10 +5,17 @@ Handles different formats and normalizes everything to a consistent format.
 
 import numpy as np
 import torch
-from PIL import Image
 from pathlib import Path
 import pydicom
 from typing import Tuple, Optional, Dict
+
+# Try to import fast cv2 loader; fall back to PIL
+try:
+    import cv2 as _cv2
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
+    from PIL import Image
 
 
 # ----------------------------------------------------------------
@@ -105,9 +112,22 @@ class MedicalImagePreprocessor:
         return pixel_array
 
     def _load_standard_image(self, path: Path) -> np.ndarray:
-        """Load a standard image file (JPG, PNG, etc.)."""
-        img = Image.open(path)
-        return np.array(img, dtype=np.float32)
+        """Load a standard image file (JPG, PNG, etc.).
+        Uses cv2 when available (3-5x faster than PIL).
+        """
+        if _HAS_CV2:
+            img = _cv2.imread(str(path), _cv2.IMREAD_COLOR)
+            if img is None:
+                # Fallback for exotic formats cv2 can't handle
+                from PIL import Image
+                return np.array(Image.open(path), dtype=np.float32)
+            # cv2 loads BGR → convert to RGB
+            img = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB)
+            return img.astype(np.float32)
+        else:
+            from PIL import Image
+            img = Image.open(path)
+            return np.array(img, dtype=np.float32)
 
     def _load_nifti(self, path: Path) -> np.ndarray:
         """Load a NIfTI file (3D brain/body scans)."""
@@ -148,12 +168,24 @@ class MedicalImagePreprocessor:
             return (image - img_min) / (img_max - img_min)
 
     def resize_image(self, image: np.ndarray) -> np.ndarray:
-        """Resize image to target size. Expects input in [0, 1] range."""
-        # Clip to [0,1] for safety, then convert to uint8 for PIL
-        image_clipped = np.clip(image, 0.0, 1.0)
-        pil_image = Image.fromarray((image_clipped * 255).astype(np.uint8))
-        pil_image = pil_image.resize(self.target_size, Image.LANCZOS)
-        return np.array(pil_image, dtype=np.float32) / 255.0
+        """Resize image to target size. Expects input in [0, 1] range.
+        Uses cv2 INTER_LINEAR when available (10x faster than PIL LANCZOS).
+        BILINEAR is fully sufficient for 224-px self-supervised training.
+        """
+        h, w = self.target_size
+        if _HAS_CV2:
+            # cv2 wants (width, height) and works directly on float32
+            image_clipped = np.clip(image, 0.0, 1.0)
+            # If the image has 2D or 3D shape, cv2 handles both
+            resized = _cv2.resize(image_clipped, (w, h),
+                                  interpolation=_cv2.INTER_LINEAR)
+            return resized.astype(np.float32)
+        else:
+            from PIL import Image
+            image_clipped = np.clip(image, 0.0, 1.0)
+            pil_image = Image.fromarray((image_clipped * 255).astype(np.uint8))
+            pil_image = pil_image.resize((w, h), Image.BILINEAR)
+            return np.array(pil_image, dtype=np.float32) / 255.0
 
     def ensure_3_channels(self, image: np.ndarray) -> np.ndarray:
         """
