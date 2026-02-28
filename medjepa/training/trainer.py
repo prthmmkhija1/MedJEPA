@@ -39,6 +39,7 @@ class MedJEPATrainer:
         train_dataset,
         config: dict,
         val_dataset=None,
+        sampler=None,
     ):
         """
         Args:
@@ -46,15 +47,16 @@ class MedJEPATrainer:
             train_dataset: Training data (PyTorch Dataset)
             config: Configuration dictionary
             val_dataset: Optional validation data
+            sampler: Optional pre-built WeightedRandomSampler (overrides _build_sampler)
         """
         self.model = model
         self.config = config
         self.device = get_device()
         self.model = self.model.to(self.device)
 
-        # Build sampler: use WeightedRandomSampler when labels exist
-        # and classes are imbalanced (which is common in medical imaging)
-        sampler = self._build_sampler(train_dataset, config)
+        # Use provided sampler, or build one from labels if available
+        if sampler is None:
+            sampler = self._build_sampler(train_dataset, config)
 
         # DataLoader: feeds batches of images to the model
         self.train_loader = DataLoader(

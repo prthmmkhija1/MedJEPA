@@ -379,6 +379,24 @@ def run_lejepa_pretraining(args):
         pct = 100 * size / len(combined)
         print(f"  {name:25s}: {size:>7d} ({pct:5.1f}%)")
 
+    # Build balanced per-dataset sampler so every dataset gets equal
+    # representation regardless of size (PCam has 327k, APTOS only 3.6k)
+    print("\nBuilding balanced dataset sampler (equal weight per dataset)...")
+    num_datasets = len(datasets)
+    sample_weights = []
+    for ds in datasets:
+        ds_size = len(ds)
+        # Each sample in this dataset gets weight = 1 / (num_datasets * ds_size)
+        # so the total weight across all datasets is equal
+        w = 1.0 / (num_datasets * ds_size)
+        sample_weights.extend([w] * ds_size)
+    balanced_sampler = torch.utils.data.WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.float64),
+        num_samples=len(combined),
+        replacement=True,
+    )
+    print(f"  Balanced sampler ready — {num_datasets} datasets, {len(combined)} total samples")
+
     # Build LeJEPA model
     model = LeJEPA(
         image_size=args.image_size,
@@ -416,7 +434,8 @@ def run_lejepa_pretraining(args):
     }
 
     # Train
-    trainer = MedJEPATrainer(model=model, train_dataset=combined, config=config)
+    trainer = MedJEPATrainer(model=model, train_dataset=combined, config=config,
+                             sampler=balanced_sampler)
     history = trainer.train()
 
     # Save history
