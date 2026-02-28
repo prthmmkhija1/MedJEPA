@@ -807,6 +807,66 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             fractions=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
         )
 
+        # N-Shot Evaluation (5-shot, 10-shot, 20-shot per class)
+        print(f"\n[{name}] N-Shot Classification (5/10/20-shot) ...")
+        n_shot_results = {}
+        unique_classes = torch.unique(train_labels)
+        for n_shot in [5, 10, 20]:
+            # Sample n_shot examples per class from training features
+            support_idx = []
+            for cls in unique_classes:
+                cls_idx = (train_labels == cls).nonzero(as_tuple=True)[0]
+                if len(cls_idx) >= n_shot:
+                    perm = cls_idx[torch.randperm(len(cls_idx))[:n_shot]]
+                else:
+                    perm = cls_idx  # use all available if fewer than n_shot
+                support_idx.append(perm)
+            support_idx = torch.cat(support_idx)
+            support_feats = train_feats[support_idx]
+            support_labs = train_labels[support_idx]
+
+            from sklearn.neighbors import KNeighborsClassifier
+            from sklearn.metrics import accuracy_score
+            k = min(5, len(support_labs))
+            knn = KNeighborsClassifier(n_neighbors=max(1, k))
+            knn.fit(support_feats.numpy(), support_labs.numpy())
+            preds = knn.predict(test_feats.numpy())
+            acc = accuracy_score(test_labels.numpy(), preds)
+            n_shot_results[f"{n_shot}-shot"] = {
+                "accuracy": acc,
+                "num_support": len(support_labs),
+            }
+            print(f"  {n_shot}-shot: Accuracy = {acc:.4f} ({len(support_labs)} support samples)")
+
+        # Supervised Baseline (random init model, same linear probe)
+        print(f"\n[{name}] Supervised Baseline (random init) ...")
+        baseline_model = LeJEPA(
+            image_size=image_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            encoder_depth=encoder_depth,
+            predictor_depth=predictor_depth,
+        ).to(device)
+        baseline_model.eval()
+
+        baseline_lp = LinearProbeEvaluator(
+            pretrained_model=baseline_model,
+            num_classes=num_classes,
+            embed_dim=embed_dim,
+        )
+        baseline_train_feats, baseline_train_labels = baseline_lp.extract_features(train_loader)
+        baseline_test_feats, baseline_test_labels = baseline_lp.extract_features(test_loader)
+        baseline_lp.train_probe(baseline_train_feats, baseline_train_labels)
+        baseline_results = baseline_lp.evaluate(baseline_test_feats, baseline_test_labels)
+        print(f"  Baseline Accuracy: {baseline_results['accuracy']:.4f}")
+        print(f"  MedJEPA  Accuracy: {lp_results['accuracy']:.4f}")
+        improvement = lp_results['accuracy'] - baseline_results['accuracy']
+        print(f"  Improvement:       {improvement:+.4f}")
+
+        del baseline_model  # free memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         all_results[name] = {
             "type": "classification",
             "description": cfg["description"],
@@ -816,6 +876,11 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 "auc": lp_results.get("auc"),
             },
             "few_shot": fs_results,
+            "n_shot": n_shot_results,
+            "supervised_baseline": {
+                "accuracy": baseline_results["accuracy"],
+                "auc": baseline_results.get("auc"),
+            },
         }
 
     # -- Evaluate 3D datasets (as 2D slices through LeJEPA) --
@@ -894,6 +959,61 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             fractions=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
         )
 
+        # N-Shot Evaluation for 3D slice datasets
+        print(f"\n[{name}] N-Shot Classification (5/10/20-shot) ...")
+        n_shot_results = {}
+        unique_classes = torch.unique(train_labels)
+        for n_shot in [5, 10, 20]:
+            support_idx = []
+            for cls in unique_classes:
+                cls_idx = (train_labels == cls).nonzero(as_tuple=True)[0]
+                if len(cls_idx) >= n_shot:
+                    perm = cls_idx[torch.randperm(len(cls_idx))[:n_shot]]
+                else:
+                    perm = cls_idx
+                support_idx.append(perm)
+            support_idx = torch.cat(support_idx)
+            support_feats = train_feats[support_idx]
+            support_labs = train_labels[support_idx]
+
+            from sklearn.neighbors import KNeighborsClassifier
+            from sklearn.metrics import accuracy_score
+            k = min(5, len(support_labs))
+            knn = KNeighborsClassifier(n_neighbors=max(1, k))
+            knn.fit(support_feats.numpy(), support_labs.numpy())
+            preds = knn.predict(test_feats.numpy())
+            acc = accuracy_score(test_labels.numpy(), preds)
+            n_shot_results[f"{n_shot}-shot"] = {
+                "accuracy": acc,
+                "num_support": len(support_labs),
+            }
+            print(f"  {n_shot}-shot: Accuracy = {acc:.4f}")
+
+        # Supervised Baseline for 3D
+        print(f"\n[{name}] Supervised Baseline (random init) ...")
+        baseline_model = LeJEPA(
+            image_size=image_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            encoder_depth=encoder_depth,
+            predictor_depth=predictor_depth,
+        ).to(device)
+        baseline_model.eval()
+        baseline_lp = LinearProbeEvaluator(
+            pretrained_model=baseline_model,
+            num_classes=num_classes,
+            embed_dim=embed_dim,
+        )
+        bl_train_feats, bl_train_labels = baseline_lp.extract_features(train_loader)
+        bl_test_feats, bl_test_labels = baseline_lp.extract_features(test_loader)
+        baseline_lp.train_probe(bl_train_feats, bl_train_labels)
+        bl_results = baseline_lp.evaluate(bl_test_feats, bl_test_labels)
+        print(f"  Baseline Accuracy: {bl_results['accuracy']:.4f}")
+        print(f"  MedJEPA  Accuracy: {lp_results['accuracy']:.4f}")
+        del baseline_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         all_results[name] = {
             "type": "3d_as_2d_slices",
             "description": cfg["description"],
@@ -904,6 +1024,11 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 "auc": lp_results.get("auc"),
             },
             "few_shot": fs_results,
+            "n_shot": n_shot_results,
+            "supervised_baseline": {
+                "accuracy": bl_results["accuracy"],
+                "auc": bl_results.get("auc"),
+            },
         }
 
     # -- Segmentation evaluation (Dice Score on BraTS 2D slices via LeJEPA) --
@@ -1182,18 +1307,25 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
 
     # -- Print summary --
     banner("ALL RESULTS SUMMARY")
-    print(f"{'Dataset':25s} | {'Type':15s} | {'LP Acc':>8s} | {'AUC':>8s} | {'Dice':>8s}")
-    print("-" * 78)
+    print(f"{'Dataset':25s} | {'Type':15s} | {'LP Acc':>8s} | {'Baseline':>8s} | {'AUC':>8s} | {'Dice':>8s}")
+    print("-" * 95)
     for name, res in all_results.items():
         lp = res.get("linear_probing", {})
         acc = lp.get("accuracy", None)
+        bl = res.get("supervised_baseline", {})
+        bl_acc = bl.get("accuracy", None)
         auc = lp.get("auc", None)
         dice = res.get("mean_dice", None)
         rtype = res.get("type", "?")
         acc_str = f"{acc:.4f}" if acc is not None else "N/A"
+        bl_str = f"{bl_acc:.4f}" if bl_acc is not None else "N/A"
         auc_str = f"{auc:.4f}" if auc is not None else "N/A"
         dice_str = f"{dice:.4f}" if dice is not None else "N/A"
-        print(f"{name:25s} | {rtype:15s} | {acc_str:>8s} | {auc_str:>8s} | {dice_str:>8s}")
+        print(f"{name:25s} | {rtype:15s} | {acc_str:>8s} | {bl_str:>8s} | {auc_str:>8s} | {dice_str:>8s}")
+
+        if res.get("n_shot"):
+            for shot_key, shot_val in res["n_shot"].items():
+                print(f"  {'':23s} |  {shot_key:>8s} -> Acc: {shot_val['accuracy']:.4f}")
 
         if res.get("few_shot"):
             for fs_entry in res["few_shot"]:
