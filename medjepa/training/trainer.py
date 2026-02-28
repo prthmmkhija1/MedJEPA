@@ -11,6 +11,7 @@ This is like a gym workout routine:
 Supports both single-GPU and multi-GPU (DDP) training.
 """
 
+import warnings
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -23,6 +24,14 @@ import os
 import numpy as np
 from typing import Optional
 from medjepa.utils.device import get_device
+
+# OneCycleLR internally calls step() during __init__, triggering a false-positive
+# "scheduler before optimizer" warning in PyTorch.  Suppress it.
+warnings.filterwarnings(
+    "ignore",
+    message=".*lr_scheduler.step\\(\\) before optimizer.step\\(\\).*",
+    category=UserWarning,
+)
 try:
     from tqdm import tqdm
 except ImportError:

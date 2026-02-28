@@ -119,9 +119,13 @@ class SIGRegLoss(nn.Module):
         """
         batch_size, num_tokens, embed_dim = embeddings.shape
         flat = embeddings.reshape(-1, embed_dim).float()
+        # Guard against inf/nan in embeddings (can occur early in training)
+        flat = torch.nan_to_num(flat, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Per-dimension std
-        std = flat.std(dim=0)  # (embed_dim,)
+        # Per-dimension std (unbiased=False avoids NaN when n=1)
+        std = flat.std(dim=0, unbiased=False)
+        # Replace any remaining NaN/inf std values with 0
+        std = torch.nan_to_num(std, nan=0.0, posinf=0.0)
 
         # Hinge: penalise only when std < target
         var_loss = torch.mean(F.relu(self.variance_target - std))
@@ -144,6 +148,8 @@ class SIGRegLoss(nn.Module):
         """
         batch_size, num_tokens, embed_dim = embeddings.shape
         flat = embeddings.reshape(-1, embed_dim).float()
+        # Guard against inf/nan in embeddings
+        flat = torch.nan_to_num(flat, nan=0.0, posinf=1.0, neginf=-1.0)
 
         # Center
         flat = flat - flat.mean(dim=0, keepdim=True)
@@ -164,6 +170,8 @@ class SIGRegLoss(nn.Module):
         diag = torch.diagonal(cov)
         off_diag = cov - torch.diag(diag)
         cov_loss = (off_diag ** 2).sum() / k
+        # Guard: cov can be nan if flat was all-zeros
+        cov_loss = torch.nan_to_num(cov_loss, nan=0.0, posinf=0.0)
         return cov_loss
 
     def regularization_loss(
@@ -202,13 +210,14 @@ class SIGRegLoss(nn.Module):
         pred_loss = self.prediction_loss(predicted_target, actual_target)
         var_loss = self.variance_loss(all_embeddings)
         cov_loss = self.covariance_loss_sketched(all_embeddings)
+
+        # nan_to_num: replaces any residual NaN with 0 so total_loss stays finite
+        var_loss = torch.nan_to_num(var_loss, nan=0.0)
+        cov_loss = torch.nan_to_num(cov_loss, nan=0.0)
         reg_loss = self.lambda_var * var_loss + self.lambda_cov * cov_loss
 
         total_loss = pred_loss + self.lambda_reg * reg_loss
-
-        # Clamp to prevent inf/nan from propagating and crashing training
-        if not torch.isfinite(total_loss):
-            total_loss = pred_loss.clamp(max=10.0) + self.lambda_reg * reg_loss.clamp(max=10.0)
+        total_loss = torch.nan_to_num(total_loss, nan=pred_loss.detach(), posinf=10.0)
 
         return {
             "total_loss": total_loss,
