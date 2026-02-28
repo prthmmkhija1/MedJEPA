@@ -92,8 +92,8 @@ class PatchMasker2D:
 
         # Convert 2D mask to 1D patch indices
         mask_flat = mask.flatten()
-        target_indices = torch.tensor(np.where(mask_flat)[0])
-        context_indices = torch.tensor(np.where(~mask_flat)[0])
+        target_indices = torch.from_numpy(np.where(mask_flat)[0].astype(np.int64))
+        context_indices = torch.from_numpy(np.where(~mask_flat)[0].astype(np.int64))
 
         return context_indices, target_indices
 
@@ -302,8 +302,8 @@ class PatchMasker3D:
 
         # Convert 3D mask to 1D patch indices
         mask_flat = mask.flatten()
-        target_indices = torch.tensor(np.where(mask_flat)[0])
-        context_indices = torch.tensor(np.where(~mask_flat)[0])
+        target_indices = torch.from_numpy(np.where(mask_flat)[0].astype(np.int64))
+        context_indices = torch.from_numpy(np.where(~mask_flat)[0].astype(np.int64))
 
         return context_indices, target_indices
 
