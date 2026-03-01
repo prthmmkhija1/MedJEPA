@@ -55,60 +55,61 @@ class MedJEPAAugmentation(nn.Module):
         Args:
             x: (B, 3, H, W) float tensor in [0, 1]
         Returns:
-            Augmented tensor, same shape
+            Augmented tensor, same shape and dtype
         """
         if not self.training:
             return x
 
-        # Remember the incoming dtype (may be bfloat16 under mixed precision)
         orig_dtype = x.dtype
-        # Work in float32 to avoid autocast dtype mismatches in non-learnable ops
-        x = x.float()
+        device_type = "cuda" if x.is_cuda else "cpu"
 
-        B = x.shape[0]
+        # Disable autocast for the entire augmentation block.
+        # torch.no_grad() does NOT disable autocast — without this, conv2d in
+        # _gaussian_blur gets silently cast to BFloat16 by the training-loop
+        # autocast context, causing a dtype mismatch on the index-put.
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            x = x.float()
+            B = x.shape[0]
 
-        # --- Random horizontal flip ---
-        if self.horizontal_flip_p > 0:
-            flip_mask = torch.rand(B, device=x.device) < self.horizontal_flip_p
-            if flip_mask.any():
-                x[flip_mask] = x[flip_mask].flip(-1)  # flip W dimension
+            # --- Random horizontal flip ---
+            if self.horizontal_flip_p > 0:
+                flip_mask = torch.rand(B, device=x.device) < self.horizontal_flip_p
+                if flip_mask.any():
+                    x[flip_mask] = x[flip_mask].flip(-1)
 
-        # --- Color jitter (brightness + contrast + saturation) ---
-        if self.color_jitter_p > 0:
-            jitter_mask = torch.rand(B, device=x.device) < self.color_jitter_p
-            if jitter_mask.any():
-                subset = x[jitter_mask]
+            # --- Color jitter (brightness + contrast + saturation) ---
+            if self.color_jitter_p > 0:
+                jitter_mask = torch.rand(B, device=x.device) < self.color_jitter_p
+                if jitter_mask.any():
+                    subset = x[jitter_mask]
 
-                # Brightness: additive shift
-                if self.brightness > 0:
-                    bfactor = (torch.rand(subset.shape[0], 1, 1, 1,
-                               device=x.device) * 2 - 1) * self.brightness
-                    subset = subset + bfactor
+                    if self.brightness > 0:
+                        bfactor = (torch.rand(subset.shape[0], 1, 1, 1,
+                                   device=x.device) * 2 - 1) * self.brightness
+                        subset = subset + bfactor
 
-                # Contrast: scale around mean
-                if self.contrast > 0:
-                    cfactor = 1.0 + (torch.rand(subset.shape[0], 1, 1, 1,
-                                     device=x.device) * 2 - 1) * self.contrast
-                    mean = subset.mean(dim=(-2, -1), keepdim=True)
-                    subset = (subset - mean) * cfactor + mean
+                    if self.contrast > 0:
+                        cfactor = 1.0 + (torch.rand(subset.shape[0], 1, 1, 1,
+                                         device=x.device) * 2 - 1) * self.contrast
+                        mean = subset.mean(dim=(-2, -1), keepdim=True)
+                        subset = (subset - mean) * cfactor + mean
 
-                # Saturation: blend with grayscale
-                if self.saturation > 0:
-                    sfactor = 1.0 + (torch.rand(subset.shape[0], 1, 1, 1,
-                                     device=x.device) * 2 - 1) * self.saturation
-                    gray = subset.mean(dim=1, keepdim=True)
-                    subset = gray + sfactor * (subset - gray)
+                    if self.saturation > 0:
+                        sfactor = 1.0 + (torch.rand(subset.shape[0], 1, 1, 1,
+                                         device=x.device) * 2 - 1) * self.saturation
+                        gray = subset.mean(dim=1, keepdim=True)
+                        subset = gray + sfactor * (subset - gray)
 
-                x[jitter_mask] = subset
+                    x[jitter_mask] = subset
 
-        # --- Gaussian blur ---
-        if self.gaussian_blur_p > 0:
-            blur_mask = torch.rand(B, device=x.device) < self.gaussian_blur_p
-            if blur_mask.any():
-                x[blur_mask] = self._gaussian_blur(x[blur_mask])
+            # --- Gaussian blur ---
+            if self.gaussian_blur_p > 0:
+                blur_mask = torch.rand(B, device=x.device) < self.gaussian_blur_p
+                if blur_mask.any():
+                    x[blur_mask] = self._gaussian_blur(x[blur_mask])
 
-        # Clamp to valid range and cast back to the original dtype
-        x = x.clamp(0.0, 1.0).to(orig_dtype)
+            # Clamp and cast back to original dtype
+            x = x.clamp(0.0, 1.0).to(orig_dtype)
 
         return x
 
