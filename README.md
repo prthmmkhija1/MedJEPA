@@ -22,7 +22,9 @@ single hyperparameter and no training heuristics.
 - **LeJEPA** for 2D medical images (X-rays, histopathology, dermatology, retinal)
 - **V-JEPA** extension for 3D volumes (CT, MRI) and medical video
 - **SIGReg** loss — Sketched Isotropic Gaussian Regularization for collapse-free training
-- Comprehensive evaluation: linear probing, few-shot (kNN), segmentation, attention maps
+- Comprehensive evaluation: linear probing, few-shot (kNN), fine-tuning, segmentation, attention maps
+- **Cross-institutional validation** with domain invariance testing
+- **ImageNet baseline comparison** (ViT-B/16) built-in
 - Privacy-preserving DICOM anonymization built-in
 
 Built for the [UCSC OSPO 2026 Open Source Research Experience](https://ucsc-ospo.github.io/project/osre26/nelbl/medjepa/).
@@ -193,13 +195,18 @@ MedJEPA/
 │   ├── evaluation/                 # Downstream evaluation
 │   │   ├── linear_probe.py         #   Linear probing evaluator
 │   │   ├── few_shot.py             #   Few-shot (kNN) evaluator
+│   │   ├── fine_tune.py            #   Full fine-tuning + ImageNet baseline
 │   │   └── segmentation.py         #   Segmentation head + Dice score
 │   └── utils/                      # Utilities
 │       ├── device.py               #   Device detection (CUDA/MPS/CPU)
-│       └── visualization.py        #   t-SNE, attention maps, loss plots (7 functions)
+│       └── visualization.py        #   t-SNE, attention maps, GradCAM (10+ functions)
 ├── scripts/
+│   ├── run_gpu_full.py             # Full 3-phase pipeline (pretrain → eval)
 │   ├── pretrain.py                 # Pre-training CLI (with --resume support)
-│   └── evaluate.py                 # Evaluation CLI (linear probe + few-shot)
+│   ├── evaluate.py                 # Evaluation CLI (linear probe + few-shot)
+│   ├── preextract_slices.py        # Pre-extract 3D→2D slices for fast I/O
+│   ├── precache_images.py          # Validate & cache image datasets
+│   └── clean_corrupted_images.py   # Remove corrupted images from datasets
 ├── configs/
 │   └── base_config.yaml            # Default hyperparameters
 ├── notebooks/
@@ -280,6 +287,27 @@ mindmap
 
 ## Evaluation
 
+MedJEPA includes a comprehensive evaluation suite:
+
+| Method                  | Description                                             | Code              |
+| ----------------------- | ------------------------------------------------------- | ----------------- |
+| **Linear Probing**      | Freeze encoder, train single linear layer               | `linear_probe.py` |
+| **Few-Shot (kNN)**      | 5/10/20-shot classification + data efficiency (1%–100%) | `few_shot.py`     |
+| **Full Fine-Tuning**    | End-to-end encoder + head training (low encoder LR)     | `fine_tune.py`    |
+| **ImageNet Baseline**   | Compare against ImageNet-pretrained ViT-B/16            | `fine_tune.py`    |
+| **Segmentation**        | Dice score on BraTS + Decathlon tasks                   | `segmentation.py` |
+| **Cross-Institutional** | Domain invariance, silhouette, cross-dataset transfer   | `run_gpu_full.py` |
+
+### Running the Full Pipeline
+
+```bash
+# Run everything: pretrain + evaluate + cross-institutional
+python scripts/run_gpu_full.py
+
+# Skip pretraining, use existing checkpoint
+python scripts/run_gpu_full.py --skip_pretrain --checkpoint checkpoints/best_model.pt
+```
+
 ### Linear Probing & Few-Shot
 
 ```bash
@@ -298,12 +326,19 @@ python scripts/pretrain.py \
 
 ### Results (to be filled after GPU training)
 
-| Dataset      | Linear Probe | 5-shot | 10-shot | Data @ 10% |
-| ------------ | ------------ | ------ | ------- | ---------- |
-| HAM10000     | —            | —      | —       | —          |
-| ChestX-ray14 | —            | —      | —       | —          |
-| APTOS        | —            | —      | —       | —          |
-| PCam         | —            | —      | —       | —          |
+| Dataset      | Linear Probe | Fine-Tune | ImageNet Baseline | 5-shot | 10-shot | Data @ 10% |
+| ------------ | ------------ | --------- | ----------------- | ------ | ------- | ---------- |
+| HAM10000     | —            | —         | —                 | —      | —       | —          |
+| ChestX-ray14 | —            | —         | —                 | —      | —       | —          |
+| APTOS        | —            | —         | —                 | —      | —       | —          |
+| PCam         | —            | —         | —                 | —      | —       | —          |
+
+| Metric                     | Value |
+| -------------------------- | ----- |
+| Domain Invariance Score    | —     |
+| Cross-Dataset kNN Transfer | —     |
+| BraTS Dice Score           | —     |
+| Decathlon Dice Score       | —     |
 
 > Results will be populated after full-scale training on GPU infrastructure.
 

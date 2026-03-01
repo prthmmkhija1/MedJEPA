@@ -70,6 +70,7 @@ from medjepa.evaluation.segmentation import (
     SegmentationEvaluator,
     dice_score,
 )
+from medjepa.evaluation.fine_tune import FineTuneEvaluator, ImageNetBaselineEvaluator
 from medjepa.utils.device import get_device, get_device_info
 
 
@@ -1027,6 +1028,60 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # ImageNet Pretrained Baseline (ViT-B/16)
+        print(f"\n[{name}] ImageNet ViT-B/16 Baseline ...")
+        inet_results = {"accuracy": None, "auc": None}
+        try:
+            inet_eval = ImageNetBaselineEvaluator(
+                num_classes=num_classes, backbone="vit_b_16",
+            )
+            inet_train_feats, inet_train_labs = inet_eval.extract_features(train_loader)
+            inet_test_feats, inet_test_labs = inet_eval.extract_features(test_loader)
+            inet_eval.train_probe(inet_train_feats, inet_train_labs)
+            inet_results = inet_eval.evaluate(inet_test_feats, inet_test_labs)
+            print(f"  ImageNet Baseline Accuracy: {inet_results['accuracy']:.4f}")
+            print(f"  MedJEPA LP Accuracy:        {lp_results['accuracy']:.4f}")
+            inet_imp = lp_results['accuracy'] - inet_results['accuracy']
+            print(f"  MedJEPA vs ImageNet:        {inet_imp:+.4f}")
+            del inet_eval
+        except Exception as e:
+            print(f"  ImageNet baseline failed: {e}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Full Fine-Tuning (end-to-end, encoder + classification head)
+        print(f"\n[{name}] Full Fine-Tuning ...")
+        ft_results = {"accuracy": None, "auc": None}
+        try:
+            ft_model = LeJEPA(
+                image_size=image_size, patch_size=patch_size,
+                embed_dim=embed_dim, encoder_depth=encoder_depth,
+                predictor_depth=predictor_depth, use_ema=True,
+            )
+            ft_model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            if "ema_encoder_state_dict" in ckpt:
+                ft_model.ema_encoder.load_state_dict(ckpt["ema_encoder_state_dict"])
+            ft_model = ft_model.to(device)
+
+            _multi_label_ft = (name == "chestxray14")
+            ft_eval = FineTuneEvaluator(
+                pretrained_model=ft_model,
+                num_classes=num_classes,
+                embed_dim=embed_dim,
+                num_epochs=20,
+            )
+            ft_history = ft_eval.train(train_loader, test_loader)
+            ft_results = ft_eval.evaluate(test_loader)
+            print(f"  Fine-Tune Accuracy: {ft_results['accuracy']:.4f}")
+            if ft_results.get("auc"):
+                print(f"  Fine-Tune AUC:      {ft_results['auc']:.4f}")
+            del ft_model, ft_eval
+        except Exception as e:
+            print(f"  Fine-tuning failed: {e}")
+            import traceback; traceback.print_exc()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         all_results[name] = {
             "type": "classification",
             "description": cfg["description"],
@@ -1040,6 +1095,14 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             "supervised_baseline": {
                 "accuracy": baseline_results["accuracy"],
                 "auc": baseline_results.get("auc"),
+            },
+            "imagenet_baseline": {
+                "accuracy": inet_results["accuracy"],
+                "auc": inet_results.get("auc"),
+            },
+            "fine_tuning": {
+                "accuracy": ft_results["accuracy"],
+                "auc": ft_results.get("auc"),
             },
         }
 
@@ -1456,6 +1519,128 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             print(f"  Decathlon {task_name} seg eval failed: {e}")
             import traceback; traceback.print_exc()
 
+    # -- Cross-Institutional Validation (Domain Generalization) --
+    banner("Cross-Institutional Validation (Domain Generalization)")
+    print("Testing representation quality across different medical institutions/datasets")
+    print("A good SSL encoder produces separable clusters regardless of data source.\n")
+
+    cross_results = {}
+    dataset_features = {}
+
+    for ci_name, ci_cfg in DATASETS_2D.items():
+        if not check_dataset_exists(ci_cfg):
+            continue
+        try:
+            ci_ds = load_2d_dataset(ci_name, ci_cfg, image_size,
+                                    with_labels=True, max_samples=args.max_samples)
+            _has_labels = hasattr(ci_ds, 'labels') and ci_ds.labels is not None
+            if not _has_labels:
+                _inner = ci_ds.dataset if hasattr(ci_ds, 'dataset') else ci_ds
+                _has_labels = hasattr(_inner, 'labels') and _inner.labels is not None
+            if not _has_labels:
+                continue
+            ci_loader = DataLoader(
+                ci_ds, batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=torch.cuda.is_available(),
+            )
+            _lp = LinearProbeEvaluator(
+                pretrained_model=lejepa, num_classes=ci_cfg["num_classes"],
+                embed_dim=embed_dim,
+            )
+            ci_feats, ci_labs = _lp.extract_features(ci_loader)
+            dataset_features[ci_name] = {
+                "features": ci_feats, "labels": ci_labs,
+                "num_classes": ci_cfg["num_classes"],
+            }
+            print(f"  {ci_name}: extracted {ci_feats.shape[0]} feature vectors")
+        except Exception as e:
+            print(f"  {ci_name}: skipped ({e})")
+
+    if len(dataset_features) >= 2:
+        from sklearn.metrics import silhouette_score
+
+        # 1. Per-dataset silhouette score (representation quality)
+        print("\n--- Per-Dataset Silhouette Scores ---")
+        for ci_name, ci_data in dataset_features.items():
+            try:
+                _n = min(3000, len(ci_data["labels"]))
+                _idx = np.random.choice(len(ci_data["labels"]), _n, replace=False)
+                sil = silhouette_score(
+                    ci_data["features"][_idx].numpy(),
+                    ci_data["labels"][_idx].numpy(),
+                )
+                cross_results[f"{ci_name}_silhouette"] = float(sil)
+                print(f"  {ci_name}: Silhouette = {sil:.4f}")
+            except Exception as e:
+                print(f"  {ci_name}: could not compute silhouette ({e})")
+
+        # 2. Cross-dataset kNN transfer (compatible label spaces)
+        print("\n--- Cross-Dataset Transfer (kNN) ---")
+        ci_ds_names = list(dataset_features.keys())
+        for ci_src in ci_ds_names:
+            for ci_tgt in ci_ds_names:
+                if ci_src == ci_tgt:
+                    continue
+                src_d = dataset_features[ci_src]
+                tgt_d = dataset_features[ci_tgt]
+                if src_d["num_classes"] != tgt_d["num_classes"]:
+                    continue
+                try:
+                    from sklearn.neighbors import KNeighborsClassifier
+                    from sklearn.metrics import accuracy_score as _acc
+                    _k = min(5, len(src_d["labels"]))
+                    knn = KNeighborsClassifier(n_neighbors=max(1, _k))
+                    knn.fit(src_d["features"].numpy(), src_d["labels"].numpy())
+                    _preds = knn.predict(tgt_d["features"].numpy())
+                    _accuracy = float(_acc(tgt_d["labels"].numpy(), _preds))
+                    pair_key = f"{ci_src}->{ci_tgt}"
+                    cross_results[pair_key] = {
+                        "accuracy": _accuracy, "type": "knn_transfer",
+                    }
+                    print(f"  {pair_key}: kNN Accuracy = {_accuracy:.4f}")
+                except Exception as e:
+                    print(f"  {ci_src}->{ci_tgt}: failed ({e})")
+
+        # 3. Domain invariance test — can a kNN distinguish which dataset
+        #    a feature vector came from?  Low accuracy = domain-invariant.
+        print("\n--- Domain Invariance Test ---")
+        try:
+            all_ci_feats = []
+            all_source_ids = []
+            for _i, (_ci_name, _ci_data) in enumerate(dataset_features.items()):
+                _n = min(1000, len(_ci_data["features"]))
+                _idx = np.random.choice(len(_ci_data["features"]), _n, replace=False)
+                all_ci_feats.append(_ci_data["features"][_idx])
+                all_source_ids.extend([_i] * _n)
+            all_ci_feats = torch.cat(all_ci_feats).numpy()
+            all_source_ids = np.array(all_source_ids)
+
+            from sklearn.neighbors import KNeighborsClassifier
+            from sklearn.model_selection import cross_val_score
+            knn_domain = KNeighborsClassifier(n_neighbors=5)
+            domain_scores = cross_val_score(
+                knn_domain, all_ci_feats, all_source_ids, cv=3,
+            )
+            domain_acc = float(np.mean(domain_scores))
+            random_chance = 1.0 / len(dataset_features)
+            invariance = 1.0 - (domain_acc - random_chance) / max(1.0 - random_chance, 1e-6)
+            cross_results["domain_invariance"] = {
+                "domain_classification_accuracy": domain_acc,
+                "random_chance": random_chance,
+                "invariance_score": float(np.clip(invariance, 0.0, 1.0)),
+            }
+            print(f"  Domain classification accuracy: {domain_acc:.4f} "
+                  f"(random chance: {random_chance:.4f})")
+            print(f"  Domain invariance score: {float(np.clip(invariance, 0, 1)):.4f} "
+                  f"(1.0 = perfectly invariant, 0.0 = fully separable)")
+        except Exception as e:
+            print(f"  Domain invariance test failed: {e}")
+
+        all_results["cross_institutional"] = cross_results
+    else:
+        print("  Need >= 2 datasets for cross-institutional validation. Skipping.")
+
     # -- Save all results --
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1466,21 +1651,29 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
 
     # -- Print summary --
     banner("ALL RESULTS SUMMARY")
-    print(f"{'Dataset':25s} | {'Type':15s} | {'LP Acc':>8s} | {'Baseline':>8s} | {'AUC':>8s} | {'Dice':>8s}")
-    print("-" * 95)
+    print(f"{'Dataset':25s} | {'Type':15s} | {'LP Acc':>8s} | {'Baseline':>8s} | {'ImageNet':>8s} | {'FineTune':>8s} | {'AUC':>8s} | {'Dice':>8s}")
+    print("-" * 120)
     for name, res in all_results.items():
+        if name == "cross_institutional":
+            continue  # printed separately below
         lp = res.get("linear_probing", {})
         acc = lp.get("accuracy", None)
         bl = res.get("supervised_baseline", {})
         bl_acc = bl.get("accuracy", None)
+        inet = res.get("imagenet_baseline", {})
+        inet_acc = inet.get("accuracy", None)
+        ft = res.get("fine_tuning", {})
+        ft_acc = ft.get("accuracy", None)
         auc = lp.get("auc", None)
         dice = res.get("mean_dice", None)
         rtype = res.get("type", "?")
         acc_str = f"{acc:.4f}" if acc is not None else "N/A"
         bl_str = f"{bl_acc:.4f}" if bl_acc is not None else "N/A"
+        inet_str = f"{inet_acc:.4f}" if inet_acc is not None else "N/A"
+        ft_str = f"{ft_acc:.4f}" if ft_acc is not None else "N/A"
         auc_str = f"{auc:.4f}" if auc is not None else "N/A"
         dice_str = f"{dice:.4f}" if dice is not None else "N/A"
-        print(f"{name:25s} | {rtype:15s} | {acc_str:>8s} | {bl_str:>8s} | {auc_str:>8s} | {dice_str:>8s}")
+        print(f"{name:25s} | {rtype:15s} | {acc_str:>8s} | {bl_str:>8s} | {inet_str:>8s} | {ft_str:>8s} | {auc_str:>8s} | {dice_str:>8s}")
 
         if res.get("n_shot"):
             for shot_key, shot_val in res["n_shot"].items():
@@ -1491,6 +1684,18 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 frac = fs_entry.get("fraction", "?")
                 facc = fs_entry.get("accuracy", 0)
                 print(f"  {'':23s} |  {frac*100:5.1f}% data -> Acc: {facc:.4f}")
+
+    # Print cross-institutional results
+    ci = all_results.get("cross_institutional", {})
+    if ci:
+        print("\n--- Cross-Institutional Validation ---")
+        for ci_key, ci_val in ci.items():
+            if isinstance(ci_val, dict) and "accuracy" in ci_val:
+                print(f"  {ci_key:35s} | Accuracy: {ci_val['accuracy']:.4f}")
+            elif isinstance(ci_val, dict) and "invariance_score" in ci_val:
+                print(f"  Domain Invariance Score: {ci_val['invariance_score']:.4f}")
+            elif isinstance(ci_val, float):
+                print(f"  {ci_key:35s} | Silhouette: {ci_val:.4f}")
 
     print(f"\nResults saved to: {out_path}")
     return all_results
