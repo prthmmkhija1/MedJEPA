@@ -61,6 +61,7 @@ class MedJEPAAugmentation(nn.Module):
             return x
 
         B = x.shape[0]
+        dtype = x.dtype  # preserve original dtype (may be bfloat16)
 
         # --- Random horizontal flip ---
         if self.horizontal_flip_p > 0:
@@ -77,20 +78,20 @@ class MedJEPAAugmentation(nn.Module):
                 # Brightness: additive shift
                 if self.brightness > 0:
                     bfactor = (torch.rand(subset.shape[0], 1, 1, 1,
-                               device=x.device) * 2 - 1) * self.brightness
+                               device=x.device, dtype=dtype) * 2 - 1) * self.brightness
                     subset = subset + bfactor
 
                 # Contrast: scale around mean
                 if self.contrast > 0:
                     cfactor = 1.0 + (torch.rand(subset.shape[0], 1, 1, 1,
-                                     device=x.device) * 2 - 1) * self.contrast
+                                     device=x.device, dtype=dtype) * 2 - 1) * self.contrast
                     mean = subset.mean(dim=(-2, -1), keepdim=True)
                     subset = (subset - mean) * cfactor + mean
 
                 # Saturation: blend with grayscale
                 if self.saturation > 0:
                     sfactor = 1.0 + (torch.rand(subset.shape[0], 1, 1, 1,
-                                     device=x.device) * 2 - 1) * self.saturation
+                                     device=x.device, dtype=dtype) * 2 - 1) * self.saturation
                     gray = subset.mean(dim=1, keepdim=True)
                     subset = gray + sfactor * (subset - gray)
 
@@ -109,12 +110,13 @@ class MedJEPAAugmentation(nn.Module):
 
     def _gaussian_blur(self, x: torch.Tensor) -> torch.Tensor:
         """Apply Gaussian blur using depthwise conv2d (fast, GPU-native)."""
+        orig_dtype = x.dtype
         k = self.blur_kernel_size
-        # Build 1D Gaussian kernel
+        # Build 1D Gaussian kernel (in input dtype to avoid promotion)
         sigma = 0.3 * ((k - 1) * 0.5 - 1) + 0.8
         coords = torch.arange(k, dtype=torch.float32, device=x.device) - k // 2
         g = torch.exp(-coords ** 2 / (2 * sigma ** 2))
-        g = g / g.sum()
+        g = (g / g.sum()).to(dtype=orig_dtype)
         # Separable 2D: horizontal then vertical
         kernel_h = g.view(1, 1, 1, k).expand(3, -1, -1, -1)
         kernel_v = g.view(1, 1, k, 1).expand(3, -1, -1, -1)
