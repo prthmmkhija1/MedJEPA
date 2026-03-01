@@ -123,7 +123,11 @@ class FineTuneEvaluator:
                 images, labels = batch[0].to(self.device), batch[1].to(self.device)
 
                 optimizer.zero_grad()
-                features = self.model.encode(images)  # (B, D)
+                # Use gradient-enabled encode for fine-tuning
+                if hasattr(self.model, 'encode_with_grad'):
+                    features = self.model.encode_with_grad(images)
+                else:
+                    features = self.model.encode(images)
                 logits = self.head(features)
                 loss = criterion(logits, labels)
                 loss.backward()
@@ -150,6 +154,11 @@ class FineTuneEvaluator:
                 if (epoch + 1) % 5 == 0 or epoch == 0:
                     print(f"  FT Epoch {epoch+1}/{self.num_epochs} | "
                           f"Loss: {avg_loss:.4f}")
+
+        # Sync EMA encoder with fine-tuned encoder weights so
+        # encode() (used during evaluation) reflects the fine-tuned state
+        if hasattr(self.model, 'ema_encoder') and self.model.ema_encoder is not None:
+            self.model.ema_encoder.load_state_dict(self.model.encoder.state_dict())
 
         # Re-freeze encoder after fine-tuning to be safe
         for p in self.model.parameters():

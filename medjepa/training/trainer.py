@@ -141,6 +141,13 @@ def _safe_collate(batch):
             )
 
     if not filtered:
+        # All images had different shapes — return a 1-sample placeholder.
+        # The training loop will see a batch of size 1 which is harmless
+        # (single-sample gradients are noisy but finite).
+        import logging
+        logging.getLogger(__name__).warning(
+            f"All {len(images)} items had mismatched shapes; returning 1-sample placeholder."
+        )
         return torch.zeros(1, *target_shape)
 
     return torch.stack(filtered, 0)
@@ -248,14 +255,21 @@ class MedJEPATrainer:
         # Disable CUDA graphs (triton.cudagraphs=False) — they crash on any
         # dynamic tensor inside the graph (random sketch matrix, variable-size
         # mask indices, etc.).  All Triton kernel auto-tuning still applies.
+        # On Windows, Triton is NOT available, so max-autotune will fail.
+        # Use mode="default" instead (still benefits from torch.compile graph
+        # optimizations, just skips Triton kernel tuning).
+        import platform as _platform
+        _is_windows = _platform.system() == "Windows"
+        _compile_mode = "default" if _is_windows else "max-autotune"
+        _compile_options = {} if _is_windows else {"triton.cudagraphs": False}
         if config.get("compile_model", True) and hasattr(torch, "compile"):
             try:
                 self.model = torch.compile(
                     self.model,
-                    mode="max-autotune",
-                    options={"triton.cudagraphs": False},
+                    mode=_compile_mode,
+                    options=_compile_options,
                 )
-                print("  torch.compile enabled (max-autotune, no cudagraphs)")
+                print(f"  torch.compile enabled (mode={_compile_mode})")
             except Exception as e:
                 print(f"  torch.compile unavailable: {e}")
 
@@ -289,8 +303,17 @@ class MedJEPATrainer:
             self.val_loader = None
 
         # Optimizer: the algorithm that updates model weights
-        # Fused AdamW merges multiple CUDA kernels → fewer launches → faster
-        _use_fused = torch.cuda.is_available() and hasattr(torch.optim.AdamW, 'fused')
+        # Fused AdamW merges multiple CUDA kernels → fewer launches → faster.
+        # Guard: some CUDA builds lack fused support; fall back gracefully.
+        _use_fused = False
+        if torch.cuda.is_available():
+            try:
+                # Test-construct a tiny fused optimizer to see if it works
+                _test_p = torch.nn.Linear(1, 1, device='cuda').parameters()
+                torch.optim.AdamW(_test_p, fused=True)
+                _use_fused = True
+            except Exception:
+                _use_fused = False
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config.get("learning_rate", 1e-3),
@@ -396,7 +419,7 @@ class MedJEPATrainer:
         # Early stopping: stop training when loss stops improving.
         # Saves potentially 30-50% of total wall time by avoiding
         # unnecessary epochs after convergence.
-        self._es_patience = config.get("early_stopping_patience", 15)
+        self._es_patience = config.get("early_stopping_patience", 30)
         self._es_min_delta = config.get("early_stopping_min_delta", 1e-4)
         self._es_epochs_no_improve = 0
         self._es_best_loss = float("inf")
@@ -620,16 +643,36 @@ class MedJEPATrainer:
         if not getattr(self, '_scheduler_step_per_batch', False):
             self.scheduler.step()
 
+        # Clean up any leftover accumulated gradients at epoch boundary.
+        # Without this, if len(loader) % grad_accum_steps != 0, dirty
+        # gradients from the last partial cycle bleed into the next epoch.
+        self.optimizer.zero_grad(set_to_none=True)
+
         avg_loss = total_loss / max(num_batches, 1)
         return avg_loss
 
-    def train(self) -> dict:
+    def train(self, resume_checkpoint: str = None) -> dict:
         """
         Full training loop: run for all epochs.
+        Supports resuming from a checkpoint via resume_checkpoint path.
         """
         num_epochs = self.config.get("num_epochs", 100)
         save_every = self.config.get("save_every", 5)
         best_loss = float("inf")
+        self._start_epoch = 0
+
+        # Auto-resume from checkpoint
+        if resume_checkpoint and Path(resume_checkpoint).exists():
+            try:
+                resumed_epoch = self.load_checkpoint(resume_checkpoint)
+                self._start_epoch = resumed_epoch + 1
+                if is_main_process():
+                    print(f"\n  Resuming training from epoch {self._start_epoch} "
+                          f"(loaded {Path(resume_checkpoint).name})")
+            except Exception as e:
+                if is_main_process():
+                    print(f"  Could not resume from checkpoint: {e}. Starting fresh.")
+                self._start_epoch = 0
 
         if is_main_process():
             print("=" * 60)
@@ -642,7 +685,7 @@ class MedJEPATrainer:
             print(f"Training samples: {len(self.train_loader.dataset)}")
             print("=" * 60)
 
-        for epoch in range(num_epochs):
+        for epoch in range(self._start_epoch, num_epochs):
             epoch_start = time.time()
 
             # DDP: set epoch so shuffling differs each epoch
@@ -688,16 +731,25 @@ class MedJEPATrainer:
                     avg_pred = sum(recent_pred) / len(recent_pred)
                     avg_reg = sum(recent_reg) / len(recent_reg)
 
-                    if avg_reg < 0.01 and avg_pred < 0.001:
-                        print(
-                            f"  ⚠ WARNING: Potential stagnation detected!\n"
-                            f"    pred_loss={avg_pred:.6f} (very low) and "
-                            f"reg_loss={avg_reg:.6f} (near zero).\n"
-                            f"    If pred doesn't rise in next epochs, the model "
-                            f"may not be learning meaningful features.\n"
-                            f"    Consider: lowering EMA momentum, increasing "
-                            f"lambda_reg, or checking data diversity."
-                        )
+                    if avg_reg < 0.005 and avg_pred < 0.0002:
+                        # Only warn if pred_loss is truly flat/decreasing (not rising)
+                        pred_rising = (len(self._epoch_pred_losses) >= 3 and
+                                       self._epoch_pred_losses[-1] > self._epoch_pred_losses[-3])
+                        if not pred_rising:
+                            print(
+                                f"  ⚠ WARNING: Potential stagnation detected!\n"
+                                f"    pred_loss={avg_pred:.6f} (very low) and "
+                                f"reg_loss={avg_reg:.6f} (near zero).\n"
+                                f"    If pred doesn't rise in next epochs, the model "
+                                f"may not be learning meaningful features.\n"
+                                f"    Consider: lowering EMA momentum, increasing "
+                                f"lambda_reg, or checking data diversity."
+                            )
+                        else:
+                            print(
+                                f"  ✓ Healthy: pred_loss rising ({avg_pred:.6f}), "
+                                f"regularization settled ({avg_reg:.6f})"
+                            )
                     elif avg_reg < 0.01 and avg_pred > 0.001:
                         print(
                             f"  ✓ Healthy: reg settled ({avg_reg:.4f}), "
@@ -728,7 +780,7 @@ class MedJEPATrainer:
 
             if (self._es_patience > 0
                     and self._es_epochs_no_improve >= self._es_patience
-                    and epoch >= self.warmup_epochs + self._es_patience):
+                    and epoch >= max(self.warmup_epochs + self._es_patience, 50)):
                 if is_main_process():
                     print(
                         f"\n  Early stopping: no improvement for "
@@ -757,11 +809,13 @@ class MedJEPATrainer:
         filename = "best_model.pt" if is_best else f"checkpoint_epoch_{epoch+1}.pt"
         path = self.checkpoint_dir / filename
 
-        # Unwrap DDP module if present
-        model_to_save = self.model.module if hasattr(self.model, "module") else self.model
-        # Unwrap torch.compile wrapper if present
+        # Unwrap torch.compile wrapper if present (must be first — compile is outermost)
+        model_to_save = self.model
         if hasattr(model_to_save, '_orig_mod'):
             model_to_save = model_to_save._orig_mod
+        # Unwrap DDP module if present (DDP is inside compile)
+        if hasattr(model_to_save, 'module'):
+            model_to_save = model_to_save.module
 
         checkpoint = {
             "epoch": epoch,
@@ -770,6 +824,13 @@ class MedJEPATrainer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "loss": loss,
             "config": self.config,
+            # Training state needed for correct resume
+            "global_step": self._global_step,
+            "es_best_loss": self._es_best_loss,
+            "es_epochs_no_improve": self._es_epochs_no_improve,
+            "history": self.history,
+            "epoch_pred_losses": self._epoch_pred_losses,
+            "epoch_reg_losses": self._epoch_reg_losses,
         }
         # Save EMA encoder state if present
         if hasattr(model_to_save, 'ema_encoder') and model_to_save.ema_encoder is not None:
@@ -778,21 +839,64 @@ class MedJEPATrainer:
         torch.save(checkpoint, path)
         print(f"  Saved checkpoint: {path}")
 
+        # Cleanup: keep only the last 3 epoch checkpoints + best_model.pt
+        if not is_best:
+            import re as _re
+            def _epoch_num(p):
+                m = _re.search(r'epoch_(\d+)', p.name)
+                return int(m.group(1)) if m else 0
+            all_ckpts = sorted(
+                self.checkpoint_dir.glob("checkpoint_epoch_*.pt"),
+                key=_epoch_num,
+            )
+            while len(all_ckpts) > 3:
+                old = all_ckpts.pop(0)
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+
     def load_checkpoint(self, path: str):
         """Load a saved model to resume training or for evaluation."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        # Unwrap compiled model if present
+
+        # ---------- Unwrap compile + DDP to get the raw model ----------
+        # Structure may be: compile(DDP(raw)), DDP(raw), compile(raw), or raw
         model = self.model
-        if hasattr(model, '_orig_mod'):
+        if hasattr(model, '_orig_mod'):       # unwrap torch.compile
             model = model._orig_mod
+        if hasattr(model, 'module'):           # unwrap DDP
+            model = model.module
+
         model.load_state_dict(checkpoint["model_state_dict"])
+
         # Restore EMA encoder state if present
         if "ema_encoder_state_dict" in checkpoint:
-            inner = model.module if hasattr(model, 'module') else model
-            if hasattr(inner, 'ema_encoder') and inner.ema_encoder is not None:
-                inner.ema_encoder.load_state_dict(checkpoint["ema_encoder_state_dict"])
+            if hasattr(model, 'ema_encoder') and model.ema_encoder is not None:
+                model.ema_encoder.load_state_dict(checkpoint["ema_encoder_state_dict"])
+
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
         if "scheduler_state_dict" in checkpoint:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            try:
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            except Exception as e:
+                print(f"  WARNING: Could not restore scheduler state: {e}")
+                print("  Scheduler will continue from its initial state.")
+
+        # ---------- Restore training state ----------
+        if "global_step" in checkpoint:
+            self._global_step = checkpoint["global_step"]
+        if "es_best_loss" in checkpoint:
+            self._es_best_loss = checkpoint["es_best_loss"]
+        if "es_epochs_no_improve" in checkpoint:
+            self._es_epochs_no_improve = checkpoint["es_epochs_no_improve"]
+        if "history" in checkpoint:
+            self.history = checkpoint["history"]
+        if "epoch_pred_losses" in checkpoint:
+            self._epoch_pred_losses = checkpoint["epoch_pred_losses"]
+        if "epoch_reg_losses" in checkpoint:
+            self._epoch_reg_losses = checkpoint["epoch_reg_losses"]
+
         print(f"Loaded checkpoint from epoch {checkpoint['epoch']+1}")
         return checkpoint["epoch"]

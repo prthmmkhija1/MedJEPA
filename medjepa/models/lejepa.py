@@ -267,3 +267,31 @@ class LeJEPA(nn.Module):
             else:
                 embeddings = encoder(images)
                 return embeddings.mean(dim=1)
+
+    def encode_with_grad(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Encode images WITH gradient flow — used for full fine-tuning.
+
+        Unlike encode() which wraps in torch.no_grad(), this allows gradients
+        to flow through the encoder so it can be updated during fine-tuning.
+        Always uses the online encoder (not EMA) since we want to update it.
+        """
+        encoder = self.encoder  # online encoder for fine-tuning
+
+        if self.multiscale_layers > 1:
+            x = encoder.patch_embed(images)
+            x = x + encoder.pos_embed
+
+            layer_outputs = []
+            for block in encoder.blocks:
+                x = block(x)
+                layer_outputs.append(x)
+
+            n = min(self.multiscale_layers, len(layer_outputs))
+            stacked = torch.stack(layer_outputs[-n:], dim=0)
+            pooled = stacked.mean(dim=0)
+            pooled = encoder.norm(pooled)
+            return pooled.mean(dim=1)
+        else:
+            embeddings = encoder(images)
+            return embeddings.mean(dim=1)

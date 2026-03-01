@@ -77,14 +77,20 @@ class SIGRegLoss(nn.Module):
         Return a fixed random Gaussian projection matrix R of shape
         (embed_dim, sketch_dim) scaled by 1/sqrt(sketch_dim).
 
-        This is re-created if embed_dim changes or it hasn't been built yet.
+        This is re-created if embed_dim changes, it hasn't been built yet,
+        or the matrix is on a different device (e.g. after model.to(device)).
         The matrix is registered as a buffer (no gradients, moves with device).
         """
-        if self._sketch_matrix.numel() == 0 or self._sketch_embed_dim != embed_dim:
+        if (self._sketch_matrix.numel() == 0
+                or self._sketch_embed_dim != embed_dim
+                or self._sketch_matrix.device != device):
             k = min(self.sketch_dim, embed_dim)
             R = torch.randn(embed_dim, k, device=device) / math.sqrt(k)
-            # In-place replace the buffer data (avoid register_buffer in forward)
-            self._sketch_matrix = R
+            # Re-register as a proper buffer so it follows .to(device) calls.
+            # NOTE: register_buffer inside forward can confuse torch.compile,
+            # but the branch only fires on first call (or device change), not
+            # every step — so the compile graph is stable after warm-up.
+            self.register_buffer("_sketch_matrix", R)
             self._sketch_embed_dim = embed_dim
         return self._sketch_matrix
 
@@ -224,7 +230,8 @@ class SIGRegLoss(nn.Module):
         reg_loss = self.lambda_var * var_loss + self.lambda_cov * cov_loss
 
         total_loss = pred_loss + self.lambda_reg * reg_loss
-        total_loss = torch.nan_to_num(total_loss, nan=pred_loss.detach().item(), posinf=10.0)
+        # nan_to_num: replace residual NaN with pred_loss (no .item() sync)
+        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=10.0)
 
         return {
             "total_loss": total_loss,

@@ -152,6 +152,144 @@ for _task_dir in sorted(DECATHLON_BASE.glob("Task*")) if DECATHLON_BASE.exists()
         }
 
 
+# ===============================================================
+# Segmentation Slice Datasets (module-level for DataLoader pickling)
+# ===============================================================
+# These MUST be at module level — not inside a function — because
+# Windows uses 'spawn' for DataLoader workers, which requires the
+# dataset class to be picklable.  Inner (nested) classes cannot
+# be pickled, causing AttributeError crashes on Windows.
+# ===============================================================
+
+class BraTSSegSliceDataset(torch.utils.data.Dataset):
+    """Yields (image_3ch, mask) pairs from BraTS FLAIR + seg."""
+    def __init__(self, subjects, img_size=224, slices_per_vol=10):
+        import nibabel as nib
+        self.samples = []  # (flair_path, seg_path, slice_idx)
+        self.img_size = img_size
+        for sdir in subjects:
+            sdir = Path(sdir)
+            flair = sdir / f"{sdir.name}_flair.nii.gz"
+            seg   = sdir / f"{sdir.name}_seg.nii.gz"
+            if flair.exists() and seg.exists():
+                n_slices = nib.load(str(flair)).shape[2]
+                lo = int(n_slices * 0.2)
+                hi = int(n_slices * 0.8)
+                step = max((hi - lo) // slices_per_vol, 1)
+                for si in range(lo, hi, step):
+                    self.samples.append((str(flair), str(seg), si))
+        self._cache = {}
+
+    def _load(self, path):
+        if path not in self._cache:
+            import nibabel as nib
+            self._cache[path] = nib.load(path).get_fdata().astype(np.float32)
+        return self._cache[path]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        from PIL import Image as PILImage
+        flair_p, seg_p, si = self.samples[idx]
+        vol = self._load(flair_p)
+        seg = self._load(seg_p)
+        slc = vol[:, :, si]
+        msk = seg[:, :, si]
+
+        # Normalize image to 0-1
+        smin, smax = slc.min(), slc.max()
+        if smax - smin > 0:
+            slc = (slc - smin) / (smax - smin)
+        else:
+            slc = np.zeros_like(slc)
+
+        sz = (self.img_size, self.img_size)
+        pil_img = PILImage.fromarray((slc * 255).astype(np.uint8))
+        pil_img = pil_img.resize(sz, PILImage.LANCZOS)
+        slc = np.array(pil_img, dtype=np.float32) / 255.0
+
+        # Binary mask: any tumor label > 0
+        msk_bin = (msk > 0).astype(np.uint8)
+        pil_msk = PILImage.fromarray(msk_bin * 255)
+        pil_msk = pil_msk.resize(sz, PILImage.NEAREST)
+        msk_t = torch.tensor(
+            (np.array(pil_msk) > 127).astype(np.int64)
+        )
+
+        image = np.stack([slc, slc, slc], axis=-1)
+        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
+        return image, msk_t
+
+
+class DecaSegSliceDataset(torch.utils.data.Dataset):
+    """Yields (image_3ch, mask) pairs from a Decathlon task."""
+    def __init__(self, entries, tdir, img_size=224, slices_per_vol=10):
+        import nibabel as nib
+        self.samples = []
+        self.img_size = img_size
+        self._cache = {}
+        tdir = Path(tdir)
+        for entry in entries:
+            img_p = tdir / entry["image"].lstrip("./")
+            lbl_rel = entry.get("label", "")
+            lbl_p = tdir / lbl_rel.lstrip("./") if lbl_rel else None
+            if img_p.exists() and lbl_p and lbl_p.exists():
+                shape = nib.load(str(img_p)).shape
+                n = shape[2] if len(shape) >= 3 else 1
+                lo, hi = int(n * 0.2), int(n * 0.8)
+                step = max((hi - lo) // slices_per_vol, 1)
+                for si in range(lo, hi, step):
+                    self.samples.append((str(img_p), str(lbl_p), si))
+
+    def _load(self, path):
+        if path not in self._cache:
+            import nibabel as nib
+            self._cache[path] = nib.load(path).get_fdata().astype(np.float32)
+        return self._cache[path]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        from PIL import Image as PILImage
+        img_p, lbl_p, si = self.samples[idx]
+        vol = self._load(img_p)
+        seg = self._load(lbl_p)
+        # Handle multi-channel volumes (e.g. T2+ADC)
+        if vol.ndim == 4:
+            slc = vol[:, :, si, 0]
+        elif vol.ndim >= 3:
+            slc = vol[:, :, si]
+        else:
+            slc = vol
+        if seg.ndim >= 3:
+            msk = seg[:, :, si]
+        else:
+            msk = seg
+
+        smin, smax = slc.min(), slc.max()
+        if smax - smin > 0:
+            slc = (slc - smin) / (smax - smin)
+        else:
+            slc = np.zeros_like(slc)
+
+        sz = (self.img_size, self.img_size)
+        pil_img = PILImage.fromarray((slc * 255).astype(np.uint8))
+        pil_img = pil_img.resize(sz, PILImage.LANCZOS)
+        slc = np.array(pil_img, dtype=np.float32) / 255.0
+
+        msk_bin = (msk > 0).astype(np.uint8)
+        pil_msk = PILImage.fromarray(msk_bin * 255)
+        pil_msk = pil_msk.resize(sz, PILImage.NEAREST)
+        msk_t = torch.tensor(
+            (np.array(pil_msk) > 127).astype(np.int64))
+
+        image = np.stack([slc, slc, slc], axis=-1)
+        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
+        return image, msk_t
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="MedJEPA Full GPU Pipeline (6 Datasets)")
     # Config file (defaults come from YAML, CLI overrides)
@@ -538,7 +676,7 @@ def run_lejepa_pretraining(args):
         split_encoding=_split_encoding,
         gradient_checkpointing=_grad_ckpt,
         use_ema=True,
-        ema_momentum=0.996,
+        ema_momentum=0.990,
         augmentation=aug,
     )
     total_params = sum(p.numel() for p in model.parameters())
@@ -572,10 +710,21 @@ def run_lejepa_pretraining(args):
         "use_prefetcher": not getattr(args, "no_prefetcher", False),
     }
 
+    # Check for existing checkpoint to resume from
+    resume_ckpt = None
+    _ckpt_dir = Path(args.checkpoint_dir)
+    _epoch_ckpts = sorted(_ckpt_dir.glob("checkpoint_epoch_*.pt"))
+    if _epoch_ckpts:
+        resume_ckpt = str(_epoch_ckpts[-1])
+        print(f"\n  Found existing checkpoint for resume: {resume_ckpt}")
+    elif (_ckpt_dir / "best_model.pt").exists():
+        resume_ckpt = str(_ckpt_dir / "best_model.pt")
+        print(f"\n  Found existing best_model.pt for resume: {resume_ckpt}")
+
     # Train
     trainer = MedJEPATrainer(model=model, train_dataset=combined, config=config,
                              sampler=balanced_sampler)
-    history = trainer.train()
+    history = trainer.train(resume_checkpoint=resume_ckpt)
 
     # Save history
     ckpt_dir = Path(args.checkpoint_dir)
@@ -777,7 +926,8 @@ def run_vjepa_pretraining(args):
         pin_memory=torch.cuda.is_available(),
     )
 
-    scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+    _vjepa_amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = torch.amp.GradScaler('cuda') if (torch.cuda.is_available() and _vjepa_amp_dtype == torch.float16) else None
     best_loss = float("inf")
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -801,15 +951,20 @@ def run_vjepa_pretraining(args):
             volumes = volumes.to(device)
             optimizer.zero_grad()
 
-            if scaler:
-                with torch.amp.autocast('cuda'):
+            if torch.cuda.is_available():
+                with torch.amp.autocast('cuda', dtype=_vjepa_amp_dtype):
                     losses = model(volumes)
                     loss = losses["total_loss"]
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
             else:
                 losses = model(volumes)
                 loss = losses["total_loss"]
@@ -826,7 +981,7 @@ def run_vjepa_pretraining(args):
                       f"Loss: {avg:.4f}")
 
         scheduler.step()
-        avg_loss = np.mean(epoch_losses)
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
         lr = optimizer.param_groups[0]["lr"]
         print(f"Epoch {epoch+1} avg loss: {avg_loss:.4f}  LR: {lr:.6f}")
 
@@ -1271,64 +1426,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 if d.is_dir() and d.name.startswith("BraTS")
             ])
 
-            class _BraTSSegSliceDataset(torch.utils.data.Dataset):
-                """Yields (image_3ch, mask) pairs from BraTS FLAIR + seg."""
-                def __init__(self, subjects, img_size=224, slices_per_vol=10):
-                    self.samples = []  # (flair_path, seg_path, slice_idx)
-                    self.img_size = img_size
-                    for sdir in subjects:
-                        flair = sdir / f"{sdir.name}_flair.nii.gz"
-                        seg   = sdir / f"{sdir.name}_seg.nii.gz"
-                        if flair.exists() and seg.exists():
-                            n_slices = nib.load(str(flair)).shape[2]
-                            lo = int(n_slices * 0.2)
-                            hi = int(n_slices * 0.8)
-                            step = max((hi - lo) // slices_per_vol, 1)
-                            for si in range(lo, hi, step):
-                                self.samples.append((str(flair), str(seg), si))
-                    self._cache = {}
-
-                def _load(self, path):
-                    if path not in self._cache:
-                        self._cache[path] = nib.load(path).get_fdata().astype(np.float32)
-                    return self._cache[path]
-
-                def __len__(self):
-                    return len(self.samples)
-
-                def __getitem__(self, idx):
-                    flair_p, seg_p, si = self.samples[idx]
-                    vol = self._load(flair_p)
-                    seg = self._load(seg_p)
-                    slc = vol[:, :, si]
-                    msk = seg[:, :, si]
-
-                    # Normalize image to 0-1
-                    smin, smax = slc.min(), slc.max()
-                    if smax - smin > 0:
-                        slc = (slc - smin) / (smax - smin)
-                    else:
-                        slc = np.zeros_like(slc)
-
-                    from PIL import Image as PILImage
-                    sz = (self.img_size, self.img_size)
-                    pil_img = PILImage.fromarray((slc * 255).astype(np.uint8))
-                    pil_img = pil_img.resize(sz, PILImage.LANCZOS)
-                    slc = np.array(pil_img, dtype=np.float32) / 255.0
-
-                    # Binary mask: any tumor label > 0
-                    msk_bin = (msk > 0).astype(np.uint8)
-                    pil_msk = PILImage.fromarray(msk_bin * 255)
-                    pil_msk = pil_msk.resize(sz, PILImage.NEAREST)
-                    msk_t = torch.tensor(
-                        (np.array(pil_msk) > 127).astype(np.int64)
-                    )
-
-                    image = np.stack([slc, slc, slc], axis=-1)
-                    image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
-                    return image, msk_t
-
-            seg_ds = _BraTSSegSliceDataset(
+            seg_ds = BraTSSegSliceDataset(
                 subject_dirs, img_size=image_size, slices_per_vol=10,
             )
             print(f"  BraTS seg slices: {len(seg_ds)}")
@@ -1408,71 +1506,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             with open(meta_path) as _f:
                 meta = json_mod.load(_f)
 
-            class _DecaSegSliceDataset(torch.utils.data.Dataset):
-                """Yields (image_3ch, mask) pairs from a Decathlon task."""
-                def __init__(self, entries, tdir, img_size=224, slices_per_vol=10):
-                    self.samples = []
-                    self.img_size = img_size
-                    self._cache = {}
-                    for entry in entries:
-                        img_p = tdir / entry["image"].lstrip("./")
-                        lbl_rel = entry.get("label", "")
-                        lbl_p = tdir / lbl_rel.lstrip("./") if lbl_rel else None
-                        if img_p.exists() and lbl_p and lbl_p.exists():
-                            shape = nib.load(str(img_p)).shape
-                            n = shape[2] if len(shape) >= 3 else 1
-                            lo, hi = int(n * 0.2), int(n * 0.8)
-                            step = max((hi - lo) // slices_per_vol, 1)
-                            for si in range(lo, hi, step):
-                                self.samples.append((str(img_p), str(lbl_p), si))
-
-                def _load(self, path):
-                    if path not in self._cache:
-                        self._cache[path] = nib.load(path).get_fdata().astype(np.float32)
-                    return self._cache[path]
-
-                def __len__(self):
-                    return len(self.samples)
-
-                def __getitem__(self, idx):
-                    img_p, lbl_p, si = self.samples[idx]
-                    vol = self._load(img_p)
-                    seg = self._load(lbl_p)
-                    # Handle multi-channel volumes (e.g. T2+ADC)
-                    if vol.ndim == 4:
-                        slc = vol[:, :, si, 0]
-                    elif vol.ndim >= 3:
-                        slc = vol[:, :, si]
-                    else:
-                        slc = vol
-                    if seg.ndim >= 3:
-                        msk = seg[:, :, si]
-                    else:
-                        msk = seg
-
-                    smin, smax = slc.min(), slc.max()
-                    if smax - smin > 0:
-                        slc = (slc - smin) / (smax - smin)
-                    else:
-                        slc = np.zeros_like(slc)
-
-                    from PIL import Image as PILImage
-                    sz = (self.img_size, self.img_size)
-                    pil_img = PILImage.fromarray((slc * 255).astype(np.uint8))
-                    pil_img = pil_img.resize(sz, PILImage.LANCZOS)
-                    slc = np.array(pil_img, dtype=np.float32) / 255.0
-
-                    msk_bin = (msk > 0).astype(np.uint8)
-                    pil_msk = PILImage.fromarray(msk_bin * 255)
-                    pil_msk = pil_msk.resize(sz, PILImage.NEAREST)
-                    msk_t = torch.tensor(
-                        (np.array(pil_msk) > 127).astype(np.int64))
-
-                    image = np.stack([slc, slc, slc], axis=-1)
-                    image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
-                    return image, msk_t
-
-            deca_seg_ds = _DecaSegSliceDataset(
+            deca_seg_ds = DecaSegSliceDataset(
                 meta.get("training", []), task_dir,
                 img_size=image_size, slices_per_vol=10,
             )
@@ -1744,7 +1778,13 @@ def main():
     # Phase 2: V-JEPA Pre-Training
     vjepa_ckpt = args.vjepa_checkpoint
     if not args.skip_vjepa and not vjepa_ckpt:
-        vjepa_ckpt = run_vjepa_pretraining(args)
+        try:
+            vjepa_ckpt = run_vjepa_pretraining(args)
+        except Exception as e:
+            print(f"\n  V-JEPA pre-training failed: {e}")
+            import traceback; traceback.print_exc()
+            print("  Continuing to evaluation without V-JEPA checkpoint.")
+            vjepa_ckpt = None
     elif args.skip_vjepa:
         print("\nSkipping V-JEPA pre-training.")
         if not vjepa_ckpt:
@@ -1754,7 +1794,13 @@ def main():
                 print(f"  Found existing V-JEPA checkpoint: {vjepa_ckpt}")
 
     # Phase 3: Evaluation
-    run_evaluation(args, lejepa_ckpt, vjepa_ckpt)
+    try:
+        run_evaluation(args, lejepa_ckpt, vjepa_ckpt)
+    except Exception as e:
+        print(f"\n  Evaluation phase encountered an error: {e}")
+        import traceback; traceback.print_exc()
+        print("\n  Pre-training completed successfully.")
+        print("  Re-run evaluation with: python scripts/run_gpu_full.py --skip_pretrain")
 
     elapsed = time.time() - start
     hours, rem = divmod(elapsed, 3600)
