@@ -98,18 +98,23 @@ class LinearProbeEvaluator:
         lr: float = 0.01,
         batch_size: int = 256,
     ):
-        """Train the linear classification layer."""
+        """Train the linear classification layer with cosine LR decay and
+        optional label smoothing for improved generalisation."""
         from torch.utils.data import TensorDataset, DataLoader
 
         dataset = TensorDataset(train_features, train_labels)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-        optimizer = torch.optim.SGD(self.probe.parameters(), lr=lr, momentum=0.9)
+        optimizer = torch.optim.SGD(self.probe.parameters(), lr=lr, momentum=0.9,
+                                    weight_decay=1e-4)
+        # Cosine LR schedule: smoothly decays lr → 0 over training
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_epochs, eta_min=1e-6)
 
         if self.multi_label:
             criterion = nn.BCEWithLogitsLoss()
         else:
-            criterion = nn.CrossEntropyLoss()
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
         self.probe.train()
         for epoch in range(num_epochs):
@@ -131,6 +136,8 @@ class LinearProbeEvaluator:
                 optimizer.step()
 
                 total_loss += loss.item()
+
+            scheduler.step()
 
             if (epoch + 1) % 20 == 0:
                 avg_loss = total_loss / len(loader)

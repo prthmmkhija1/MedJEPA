@@ -2,8 +2,17 @@
 LeJEPA: The Complete Model for 2D Medical Images.
 
 This puts together the encoder, predictor, masking, and loss into one model.
+
+Key accuracy techniques (added for accuracy improvement):
+- EMA (Exponential Moving Average) target encoder: produces smoother, more
+  stable target embeddings — the single biggest accuracy booster in JEPA-style
+  models (used by I-JEPA, DINO-v2, BYOL). Overhead: ~5%.
+- Multi-scale feature pooling: averages features from the last N encoder
+  layers for richer downstream representations.
+- Training augmentations: applied on-GPU before the forward pass.
 """
 
+import copy
 import torch
 import torch.nn as nn
 from medjepa.models.encoder import ViTEncoder
@@ -18,12 +27,13 @@ class LeJEPA(nn.Module):
 
     Training flow:
     1. Take a batch of medical images
-    2. Generate masks (which patches to hide)
-    3. Encode CONTEXT patches → get context embeddings
-    4. Encode TARGET patches → get target embeddings (ground truth)
-    5. PREDICT target embeddings from context embeddings
-    6. Compute loss: prediction should match target + SIGReg
-    7. Update the model to minimize the loss
+    2. Apply GPU augmentations (if enabled)
+    3. Generate masks (which patches to hide)
+    4. Encode CONTEXT patches with the online encoder (gradients)
+    5. Encode TARGET patches with the EMA encoder (no gradients, smoother)
+    6. PREDICT target embeddings from context embeddings
+    7. Compute loss: prediction should match target + SIGReg
+    8. Update online encoder via backprop; update EMA encoder via momentum
 
     Split encoding (default, ~2-3x faster):
         Instead of encoding ALL 196 patches through the 12-layer transformer,
@@ -51,13 +61,21 @@ class LeJEPA(nn.Module):
         lambda_reg: float = 1.0,
         split_encoding: bool = True,
         gradient_checkpointing: bool = False,
+        use_ema: bool = True,
+        ema_momentum: float = 0.996,
+        multiscale_layers: int = 4,
+        augmentation: nn.Module = None,
     ):
         super().__init__()
         self.split_encoding = split_encoding
+        self.use_ema = use_ema
+        self.ema_momentum = ema_momentum
+        self.multiscale_layers = multiscale_layers
+        self.augmentation = augmentation
 
         num_patches = (image_size // patch_size) ** 2
 
-        # The ONE encoder (no momentum encoder, no teacher — just one!)
+        # Online encoder (receives gradients)
         self.encoder = ViTEncoder(
             image_size=image_size,
             patch_size=patch_size,
@@ -67,6 +85,16 @@ class LeJEPA(nn.Module):
             num_heads=encoder_heads,
             use_checkpoint=gradient_checkpointing,
         )
+
+        # EMA (momentum) target encoder — produces smoother, more stable targets.
+        # Initialized as an exact copy of the online encoder; updated each step
+        # via exponential moving average: θ_ema = m * θ_ema + (1-m) * θ_online
+        if use_ema:
+            self.ema_encoder = copy.deepcopy(self.encoder)
+            for p in self.ema_encoder.parameters():
+                p.requires_grad = False
+        else:
+            self.ema_encoder = None
 
         # The predictor (smaller than encoder)
         self.predictor = JEPAPredictor(
@@ -99,7 +127,24 @@ class LeJEPA(nn.Module):
             "lambda_reg": lambda_reg,
             "split_encoding": split_encoding,
             "gradient_checkpointing": gradient_checkpointing,
+            "use_ema": use_ema,
+            "ema_momentum": ema_momentum,
         }
+
+    @torch.no_grad()
+    def update_ema(self):
+        """
+        Update the EMA target encoder: θ_ema = m * θ_ema + (1-m) * θ_online.
+
+        Called once per optimizer step (by the trainer). Cost: negligible
+        (~0.1ms — just a lerp over parameters, no forward/backward).
+        """
+        if not self.use_ema or self.ema_encoder is None:
+            return
+        m = self.ema_momentum
+        for ema_p, online_p in zip(self.ema_encoder.parameters(),
+                                    self.encoder.parameters()):
+            ema_p.data.lerp_(online_p.data, 1.0 - m)
 
     def forward(self, images: torch.Tensor) -> dict:
         """
@@ -113,31 +158,39 @@ class LeJEPA(nn.Module):
         """
         batch_size = images.shape[0]
 
+        # Step 0: Apply GPU augmentations (if provided)
+        if self.augmentation is not None and self.training:
+            images = self.augmentation(images)
+
         # Step 1: Generate mask (move indices to GPU immediately so
         # torch.compile doesn't see CPU tensors in the graph)
         context_indices, target_indices = self.masker.generate_block_mask()
         context_indices = context_indices.to(images.device, non_blocking=True)
         target_indices = target_indices.to(images.device, non_blocking=True)
 
+        # Choose which encoder produces target embeddings
+        target_encoder = self.ema_encoder if self.use_ema and self.ema_encoder is not None else self.encoder
+
         if self.split_encoding:
             # ── Split encoding (fast path) ──────────────────────────────
-            # Run the patch embedding conv2d ONCE for all 196 patches,
-            # then fork: context path gets grad, target path gets no_grad.
-            # This saves one full conv2d pass compared to calling encoder()
-            # twice with different patch_indices.
+            # Online encoder: patch embedding + context forward (with grad)
             all_patch_embeds = self.encoder.patch_embed_only(images)
-
-            # Context: positional enc + transformer on ~49 patches WITH gradients
             context_embeddings = self.encoder.forward_from_embeds(
                 all_patch_embeds, patch_indices=context_indices
             )
 
-            # Target: positional enc + transformer on ~147 patches WITHOUT gradients
-            # (targets are always detached in the loss anyway)
+            # Target encoder: produces target embeddings (always no_grad)
             with torch.no_grad():
-                target_embeddings = self.encoder.forward_from_embeds(
-                    all_patch_embeds.detach(), patch_indices=target_indices
-                )
+                if self.use_ema and self.ema_encoder is not None:
+                    # EMA encoder runs its own patch embedding for cleaner targets
+                    target_patch_embeds = target_encoder.patch_embed_only(images)
+                    target_embeddings = target_encoder.forward_from_embeds(
+                        target_patch_embeds, patch_indices=target_indices
+                    )
+                else:
+                    target_embeddings = self.encoder.forward_from_embeds(
+                        all_patch_embeds.detach(), patch_indices=target_indices
+                    )
 
             # Use context embeddings for SIGReg regularization
             reg_embeddings = context_embeddings
@@ -145,7 +198,14 @@ class LeJEPA(nn.Module):
             # ── Full encoding (legacy path) ─────────────────────────────
             all_embeddings = self.encoder(images)
             context_embeddings = all_embeddings[:, context_indices, :]
-            target_embeddings = all_embeddings[:, target_indices, :]
+
+            with torch.no_grad():
+                if self.use_ema and self.ema_encoder is not None:
+                    target_all = target_encoder(images)
+                    target_embeddings = target_all[:, target_indices, :]
+                else:
+                    target_embeddings = all_embeddings[:, target_indices, :]
+
             reg_embeddings = all_embeddings
 
         # Step 4: Predict target embeddings from context
@@ -169,12 +229,36 @@ class LeJEPA(nn.Module):
         Encode images to get their representations.
         Used AFTER training for downstream tasks (classification, etc.)
 
+        Uses multi-scale feature pooling: averages features from the last N
+        transformer layers (not just the final one). This captures both
+        low-level (edges, textures) and high-level (semantic) features,
+        producing richer representations for linear probing & few-shot.
+
         Args:
             images: shape (batch_size, 3, 224, 224)
         Returns:
             Embeddings: shape (batch_size, embed_dim)
         """
+        # Use EMA encoder for inference if available (it's more stable)
+        encoder = self.ema_encoder if self.use_ema and self.ema_encoder is not None else self.encoder
+
         with torch.no_grad():
-            embeddings = self.encoder(images)
-            # Average all patch embeddings → one embedding per image
-            return embeddings.mean(dim=1)
+            if self.multiscale_layers > 1:
+                # Multi-scale: collect intermediate features
+                x = encoder.patch_embed(images)
+                x = x + encoder.pos_embed
+
+                layer_outputs = []
+                for block in encoder.blocks:
+                    x = block(x)
+                    layer_outputs.append(x)
+
+                # Average the last N layers
+                n = min(self.multiscale_layers, len(layer_outputs))
+                stacked = torch.stack(layer_outputs[-n:], dim=0)  # (N, B, T, D)
+                pooled = stacked.mean(dim=0)  # (B, T, D)
+                pooled = encoder.norm(pooled)
+                return pooled.mean(dim=1)  # (B, D)
+            else:
+                embeddings = encoder(images)
+                return embeddings.mean(dim=1)

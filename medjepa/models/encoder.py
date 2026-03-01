@@ -18,8 +18,12 @@ from typing import Optional
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 # Enable PyTorch 2.x scaled_dot_product_attention (Flash Attention on A100)
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
+if hasattr(torch.backends, "cuda"):
+    try:
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+    except Exception:
+        pass  # CPU-only build or older PyTorch
 
 
 class PatchEmbedding(nn.Module):

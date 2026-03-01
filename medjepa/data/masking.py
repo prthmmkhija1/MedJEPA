@@ -99,13 +99,20 @@ class PatchMasker2D:
             if remaining <= 0:
                 break
 
-            # Random block size
+            # Random block size (with guards for small grid_size)
             block_h = np.random.randint(
-                self.grid_size // 4, self.grid_size // 2 + 1
+                max(self.grid_size // 4, 1), max(self.grid_size // 2 + 1, 2)
             )
             block_w = np.random.randint(
-                self.grid_size // 4, self.grid_size // 2 + 1
+                max(self.grid_size // 4, 1), max(self.grid_size // 2 + 1, 2)
             )
+
+            # Clamp block to remaining budget to avoid large overshoot
+            max_area = remaining + remaining // 4  # allow slight overshoot
+            if block_h * block_w > max_area and max_area > 0:
+                scale = (max_area / (block_h * block_w)) ** 0.5
+                block_h = max(int(block_h * scale), 1)
+                block_w = max(int(block_w * scale), 1)
 
             # Random position
             top = np.random.randint(0, self.grid_size - block_h + 1)

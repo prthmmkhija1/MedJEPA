@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Optional
 
 
 class SIGRegLoss(nn.Module):
@@ -66,8 +67,8 @@ class SIGRegLoss(nn.Module):
         # Random projection matrix — registered as a buffer so it moves
         # with .to(device) and doesn't trigger CUDA-graph recompilation.
         # Built lazily on first forward pass once we know embed_dim.
-        self._sketch_embed_dim: int | None = None
-        self.register_buffer("_sketch_matrix", None)
+        self._sketch_embed_dim: Optional[int] = None
+        self.register_buffer("_sketch_matrix", torch.empty(0))
 
     def _get_sketch_matrix(self, embed_dim: int, device: torch.device) -> torch.Tensor:
         """
@@ -77,10 +78,11 @@ class SIGRegLoss(nn.Module):
         This is re-created if embed_dim changes or it hasn't been built yet.
         The matrix is registered as a buffer (no gradients, moves with device).
         """
-        if self._sketch_matrix is None or self._sketch_embed_dim != embed_dim:
+        if self._sketch_matrix.numel() == 0 or self._sketch_embed_dim != embed_dim:
             k = min(self.sketch_dim, embed_dim)
             R = torch.randn(embed_dim, k, device=device) / math.sqrt(k)
-            self.register_buffer("_sketch_matrix", R)
+            # In-place replace the buffer data (avoid register_buffer in forward)
+            self._sketch_matrix = R
             self._sketch_embed_dim = embed_dim
         return self._sketch_matrix
 
@@ -91,7 +93,9 @@ class SIGRegLoss(nn.Module):
     ) -> torch.Tensor:
         """
         How different are the predictions from the actual embeddings?
-        Uses MSE (Mean Squared Error) — the average squared difference.
+        Uses Smooth-L1 (Huber) loss on normalized embeddings — more robust
+        than pure MSE to outlier embeddings, especially early in training
+        when the EMA target encoder hasn't stabilised yet.
 
         Args:
             predicted: What the predictor thinks the target embeddings are
@@ -101,8 +105,9 @@ class SIGRegLoss(nn.Module):
         predicted = F.normalize(predicted, dim=-1)
         target = F.normalize(target, dim=-1)
 
-        # MSE loss
-        loss = F.mse_loss(predicted, target)
+        # Smooth-L1: behaves like L1 for large errors (robust to outliers)
+        # and like L2 for small errors (smooth gradients near convergence)
+        loss = F.smooth_l1_loss(predicted, target, beta=0.5)
         return loss
 
     def variance_loss(
@@ -217,7 +222,7 @@ class SIGRegLoss(nn.Module):
         reg_loss = self.lambda_var * var_loss + self.lambda_cov * cov_loss
 
         total_loss = pred_loss + self.lambda_reg * reg_loss
-        total_loss = torch.nan_to_num(total_loss, nan=pred_loss.detach(), posinf=10.0)
+        total_loss = torch.nan_to_num(total_loss, nan=pred_loss.detach().item(), posinf=10.0)
 
         return {
             "total_loss": total_loss,

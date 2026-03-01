@@ -8,6 +8,8 @@ import torch
 from pathlib import Path
 import pydicom
 from typing import Tuple, Optional, Dict
+import os
+import contextlib
 
 # Try to import fast cv2 loader; fall back to PIL
 try:
@@ -16,6 +18,26 @@ try:
 except ImportError:
     _HAS_CV2 = False
     from PIL import Image
+
+# Suppress PIL DecompressionBomb and ICC profile Python-level warnings
+import warnings
+warnings.filterwarnings("ignore", message=".*iCCP.*")
+warnings.filterwarnings("ignore", message=".*DecompressionBomb.*")
+
+
+@contextlib.contextmanager
+def _suppress_stderr():
+    """Temporarily redirect stderr to devnull to suppress C-library warnings
+    (e.g. libpng 'iCCP: profile … not permitted' messages)."""
+    try:
+        old_fd = os.dup(2)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        yield
+    finally:
+        os.dup2(old_fd, 2)
+        os.close(old_fd)
 
 
 # ----------------------------------------------------------------
@@ -114,19 +136,25 @@ class MedicalImagePreprocessor:
     def _load_standard_image(self, path: Path) -> np.ndarray:
         """Load a standard image file (JPG, PNG, etc.).
         Uses cv2 when available (3-5x faster than PIL).
+        Suppresses libpng iCCP warnings for PNGs with invalid ICC profiles.
         """
+        _is_png = path.suffix.lower() == ".png"
         if _HAS_CV2:
-            img = _cv2.imread(str(path), _cv2.IMREAD_COLOR)
+            if _is_png:
+                with _suppress_stderr():
+                    img = _cv2.imread(str(path), _cv2.IMREAD_COLOR)
+            else:
+                img = _cv2.imread(str(path), _cv2.IMREAD_COLOR)
             if img is None:
                 # Fallback for exotic formats cv2 can't handle
                 from PIL import Image
-                return np.array(Image.open(path), dtype=np.float32)
+                return np.array(Image.open(path).convert("RGB"), dtype=np.float32)
             # cv2 loads BGR → convert to RGB
             img = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB)
             return img.astype(np.float32)
         else:
             from PIL import Image
-            img = Image.open(path)
+            img = Image.open(path).convert("RGB")
             return np.array(img, dtype=np.float32)
 
     def _load_nifti(self, path: Path) -> np.ndarray:

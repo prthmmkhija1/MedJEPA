@@ -15,6 +15,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import math
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, WeightedRandomSampler, DistributedSampler
 from pathlib import Path
@@ -378,6 +379,33 @@ class MedJEPATrainer:
         self._grad_accum_steps = config.get("gradient_accumulation_steps", 1)
         self._tb_log_every = config.get("tb_log_every", 50)  # reduce GPU syncs
 
+        # EMA momentum schedule: cosine ramp from ema_start → 1.0 over training.
+        # Higher momentum later means the target encoder changes more slowly as
+        # training progresses, producing increasingly stable targets.
+        self._ema_start = config.get("ema_momentum", 0.996)
+        self._ema_end = 1.0
+        self._total_ema_steps = (
+            config.get("num_epochs", 100)
+            * max(len(train_dataset) // max(config.get("batch_size", 32), 1), 1)
+        ) if hasattr(train_dataset, '__len__') else 100_000
+
+    def _update_ema(self):
+        """Update EMA target encoder with cosine momentum schedule."""
+        model = self.model
+        # Unwrap DDP / compiled model
+        if hasattr(model, 'module'):
+            model = model.module
+        if hasattr(model, '_orig_mod'):
+            model = model._orig_mod
+        if not hasattr(model, 'update_ema'):
+            return
+        # Cosine momentum schedule: m(t) = 1 - (1 - m_start) * (cos(π*t/T) + 1) / 2
+        # Ramps from m_start → m_end over training
+        t = min(self._global_step / max(self._total_ema_steps, 1), 1.0)
+        momentum = self._ema_end - (self._ema_end - self._ema_start) * (math.cos(math.pi * t) + 1) / 2
+        model.ema_momentum = momentum
+        model.update_ema()
+
     # ------------------------------------------------------------------
     # WeightedRandomSampler: handles class-imbalanced medical datasets
     # ------------------------------------------------------------------
@@ -484,12 +512,14 @@ class MedJEPATrainer:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
+                        self._update_ema()
                 else:
                     # BF16 path: no scaler needed (wider dynamic range)
                     loss.backward()
                     if (batch_idx + 1) % self._grad_accum_steps == 0:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         self.optimizer.step()
+                        self._update_ema()
             else:
                 losses = self.model(images)
                 loss = losses["total_loss"] / self._grad_accum_steps
@@ -499,6 +529,7 @@ class MedJEPATrainer:
                 if (batch_idx + 1) % self._grad_accum_steps == 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
+                    self._update_ema()
 
             # Track loss (avoid .item() sync on every step when possible)
             with torch.no_grad():
@@ -637,6 +668,9 @@ class MedJEPATrainer:
 
         # Unwrap DDP module if present
         model_to_save = self.model.module if hasattr(self.model, "module") else self.model
+        # Unwrap torch.compile wrapper if present
+        if hasattr(model_to_save, '_orig_mod'):
+            model_to_save = model_to_save._orig_mod
 
         checkpoint = {
             "epoch": epoch,
@@ -646,6 +680,9 @@ class MedJEPATrainer:
             "loss": loss,
             "config": self.config,
         }
+        # Save EMA encoder state if present
+        if hasattr(model_to_save, 'ema_encoder') and model_to_save.ema_encoder is not None:
+            checkpoint["ema_encoder_state_dict"] = model_to_save.ema_encoder.state_dict()
 
         torch.save(checkpoint, path)
         print(f"  Saved checkpoint: {path}")
@@ -653,7 +690,16 @@ class MedJEPATrainer:
     def load_checkpoint(self, path: str):
         """Load a saved model to resume training or for evaluation."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        # Unwrap compiled model if present
+        model = self.model
+        if hasattr(model, '_orig_mod'):
+            model = model._orig_mod
+        model.load_state_dict(checkpoint["model_state_dict"])
+        # Restore EMA encoder state if present
+        if "ema_encoder_state_dict" in checkpoint:
+            inner = model.module if hasattr(model, 'module') else model
+            if hasattr(inner, 'ema_encoder') and inner.ema_encoder is not None:
+                inner.ema_encoder.load_state_dict(checkpoint["ema_encoder_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])

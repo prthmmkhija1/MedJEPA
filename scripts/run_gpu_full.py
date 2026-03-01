@@ -52,6 +52,7 @@ from torch.utils.data import DataLoader, ConcatDataset, random_split
 
 from medjepa.models.lejepa import LeJEPA
 from medjepa.models.vjepa import VJEPA
+from medjepa.data.augmentations import MedJEPAAugmentation
 from medjepa.data.datasets import (
     MedicalImageDataset,
     ChestXray14Dataset,
@@ -524,6 +525,7 @@ def run_lejepa_pretraining(args):
     # Build LeJEPA model
     _split_encoding = not getattr(args, "no_split_encoding", False)
     _grad_ckpt = getattr(args, "gradient_checkpointing", False)
+    aug = MedJEPAAugmentation(image_size=args.image_size)
     model = LeJEPA(
         image_size=args.image_size,
         patch_size=args.patch_size,
@@ -534,6 +536,9 @@ def run_lejepa_pretraining(args):
         lambda_reg=args.lambda_reg,
         split_encoding=_split_encoding,
         gradient_checkpointing=_grad_ckpt,
+        use_ema=True,
+        ema_momentum=0.996,
+        augmentation=aug,
     )
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\nLeJEPA parameters: {total_params:,} ({total_params / 1e6:.1f}M)")
@@ -877,8 +882,12 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         embed_dim=embed_dim,
         encoder_depth=encoder_depth,
         predictor_depth=predictor_depth,
+        use_ema=True,
     )
-    lejepa.load_state_dict(ckpt["model_state_dict"])
+    lejepa.load_state_dict(ckpt["model_state_dict"], strict=False)
+    # Load EMA encoder weights if available (used for inference)
+    if "ema_encoder_state_dict" in ckpt:
+        lejepa.ema_encoder.load_state_dict(ckpt["ema_encoder_state_dict"])
     lejepa = lejepa.to(device)
     lejepa.eval()
     print("LeJEPA loaded!\n")
@@ -931,10 +940,12 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
 
         # Linear Probe
         print(f"\n[{name}] Linear Probing ...")
+        _multi_label = (name == "chestxray14")
         lp = LinearProbeEvaluator(
             pretrained_model=lejepa,
             num_classes=num_classes,
             embed_dim=embed_dim,
+            multi_label=_multi_label,
         )
         train_feats, train_labels = lp.extract_features(train_loader)
         test_feats, test_labels = lp.extract_features(test_loader)
@@ -1206,8 +1217,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                         flair = sdir / f"{sdir.name}_flair.nii.gz"
                         seg   = sdir / f"{sdir.name}_seg.nii.gz"
                         if flair.exists() and seg.exists():
-                            vol = nib.load(str(flair)).get_fdata()
-                            n_slices = vol.shape[2]
+                            n_slices = nib.load(str(flair)).shape[2]
                             lo = int(n_slices * 0.2)
                             hi = int(n_slices * 0.8)
                             step = max((hi - lo) // slices_per_vol, 1)
@@ -1346,8 +1356,8 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                         lbl_rel = entry.get("label", "")
                         lbl_p = tdir / lbl_rel.lstrip("./") if lbl_rel else None
                         if img_p.exists() and lbl_p and lbl_p.exists():
-                            vol = nib.load(str(img_p)).get_fdata()
-                            n = vol.shape[2] if vol.ndim >= 3 else 1
+                            shape = nib.load(str(img_p)).shape
+                            n = shape[2] if len(shape) >= 3 else 1
                             lo, hi = int(n * 0.2), int(n * 0.8)
                             step = max((hi - lo) // slices_per_vol, 1)
                             for si in range(lo, hi, step):
