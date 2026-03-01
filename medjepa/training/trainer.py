@@ -389,6 +389,10 @@ class MedJEPATrainer:
             * max(len(train_dataset) // max(config.get("batch_size", 32), 1), 1)
         ) if hasattr(train_dataset, '__len__') else 100_000
 
+        # Health tracking: detect training stagnation
+        self._epoch_pred_losses = []  # track pred_loss per epoch
+        self._epoch_reg_losses = []   # track reg_loss per epoch
+
     def _update_ema(self):
         """Update EMA target encoder with cosine momentum schedule."""
         model = self.model
@@ -538,6 +542,12 @@ class MedJEPATrainer:
                 total_loss += loss_val.item()
                 num_batches += 1
 
+            # Save last batch component losses for epoch-level health check
+            self._last_batch_losses = {
+                k: v.item() if torch.is_tensor(v) else v
+                for k, v in losses.items() if k != "total_loss"
+            }
+
             self._global_step += 1
 
             # OneCycleLR steps per batch; epoch-level schedulers step at epoch end
@@ -558,6 +568,15 @@ class MedJEPATrainer:
                 self.tb_writer.add_scalar(
                     "train/reg_loss_step",
                     losses["regularization_loss"].item(), self._global_step)
+                # Granular reg breakdown: var_loss and cov_loss separately
+                if "variance_loss" in losses:
+                    self.tb_writer.add_scalar(
+                        "train/var_loss_step",
+                        losses["variance_loss"].item(), self._global_step)
+                if "covariance_loss" in losses:
+                    self.tb_writer.add_scalar(
+                        "train/cov_loss_step",
+                        losses["covariance_loss"].item(), self._global_step)
 
             # Update tqdm postfix or print progress (throttled to avoid GPU sync)
             log_every = self.config.get("log_every", 50)
@@ -565,11 +584,17 @@ class MedJEPATrainer:
                 avg_loss = total_loss / max(num_batches, 1)
                 pred_val = losses["prediction_loss"].item()
                 reg_val = losses["regularization_loss"].item()
+                var_val = losses.get("variance_loss")
+                cov_val = losses.get("covariance_loss")
+                var_str = f"{var_val.item():.4f}" if var_val is not None else "?"
+                cov_str = f"{cov_val.item():.4f}" if cov_val is not None else "?"
                 if tqdm is not None and hasattr(loader, 'set_postfix'):
                     loader.set_postfix(
                         loss=f"{avg_loss:.4f}",
                         pred=f"{pred_val:.4f}",
                         reg=f"{reg_val:.4f}",
+                        var=var_str,
+                        cov=cov_str,
                     )
                 else:
                     elapsed = time.time() - start_time
@@ -577,8 +602,9 @@ class MedJEPATrainer:
                         f"  Epoch {epoch+1} | "
                         f"Batch {batch_idx+1}/{len(self.train_loader)} | "
                         f"Loss: {avg_loss:.4f} | "
-                        f"Pred Loss: {pred_val:.4f} | "
-                        f"Reg Loss: {reg_val:.4f} | "
+                        f"Pred: {pred_val:.4f} | "
+                        f"Reg: {reg_val:.4f} "
+                        f"(var={var_str}, cov={cov_str}) | "
                         f"Time: {elapsed:.1f}s"
                     )
 
@@ -635,6 +661,45 @@ class MedJEPATrainer:
                     f"Train Loss: {train_loss:.4f} | "
                     f"LR: {lr:.6f} | "
                     f"Time: {epoch_time:.1f}s\n"
+                )
+
+            # ---- Training health check (stagnation / collapse detection) ----
+            # Uses the last batch's component losses as a proxy for epoch state
+            if is_main_process() and hasattr(self, '_last_batch_losses'):
+                _lb = self._last_batch_losses
+                _pred = _lb.get("prediction_loss", 0)
+                _reg = _lb.get("regularization_loss", 0)
+                _var = _lb.get("variance_loss", 0)
+                self._epoch_pred_losses.append(_pred)
+                self._epoch_reg_losses.append(_reg)
+
+                # Warn if reg is near 0 AND pred hasn't increased since epoch 1
+                if epoch >= 4 and len(self._epoch_pred_losses) >= 5:
+                    recent_pred = self._epoch_pred_losses[-3:]
+                    recent_reg = self._epoch_reg_losses[-3:]
+                    avg_pred = sum(recent_pred) / len(recent_pred)
+                    avg_reg = sum(recent_reg) / len(recent_reg)
+
+                    if avg_reg < 0.01 and avg_pred < 0.001:
+                        print(
+                            f"  ⚠ WARNING: Potential stagnation detected!\n"
+                            f"    pred_loss={avg_pred:.6f} (very low) and "
+                            f"reg_loss={avg_reg:.6f} (near zero).\n"
+                            f"    If pred doesn't rise in next epochs, the model "
+                            f"may not be learning meaningful features.\n"
+                            f"    Consider: lowering EMA momentum, increasing "
+                            f"lambda_reg, or checking data diversity."
+                        )
+                    elif avg_reg < 0.01 and avg_pred > 0.001:
+                        print(
+                            f"  ✓ Healthy: reg settled ({avg_reg:.4f}), "
+                            f"pred driving learning ({avg_pred:.4f})"
+                        )
+
+                # Print epoch-level component breakdown
+                print(
+                    f"  Components: pred={_pred:.4f} | reg={_reg:.4f} "
+                    f"(var={_var:.4f}, cov={_lb.get('covariance_loss', 0):.4f})"
                 )
 
             # Save checkpoint (only on main process)
