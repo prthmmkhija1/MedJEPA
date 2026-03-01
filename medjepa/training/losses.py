@@ -52,8 +52,10 @@ class SIGRegLoss(nn.Module):
         variance_target: float = 1.0,
         # Target standard deviation per dimension. Embeddings are pushed
         # so that each coordinate's std is close to this value.
-        lambda_var: float = 1.0,
+        lambda_var: float = 5.0,
         # Weight for the variance regularization term.
+        # 5.0 keeps the anti-collapse signal dominant over prediction loss early
+        # in training, when pred can trivially collapse to near-zero.
         lambda_cov: float = 0.04,
         # Weight for the off-diagonal covariance term.
     ):

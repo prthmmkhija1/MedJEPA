@@ -192,8 +192,15 @@ class LeJEPA(nn.Module):
                         all_patch_embeds.detach(), patch_indices=target_indices
                     )
 
-            # Use context embeddings for SIGReg regularization
-            reg_embeddings = context_embeddings
+            # Use ALL patch embeddings (context + target) for SIGReg regularization.
+            # With mask_ratio=0.75, context alone is only 25% of patches — far too few
+            # for the variance hinge to detect collapse reliably.  target_embeddings is
+            # already detached (no grad), so concatenating is safe.
+            reg_embeddings = torch.cat(
+                [context_embeddings,
+                 target_embeddings.to(context_embeddings.dtype)],
+                dim=1,
+            )
         else:
             # ── Full encoding (legacy path) ─────────────────────────────
             all_embeddings = self.encoder(images)
