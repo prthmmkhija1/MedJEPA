@@ -73,12 +73,16 @@ class PatchMasker2D:
         """
         c, t = self._mask_cache[self._cache_idx % len(self._mask_cache)]
         self._cache_idx += 1
-        # Refresh cache periodically for diversity
+        # Regenerate cache on full cycle — critical for representation
+        # diversity.  Just reshuffling reuses the same 256 masks forever,
+        # severely limiting the masking patterns the model sees across
+        # 100+ epochs.  Regeneration costs ~1 ms (negligible vs 38 min epoch).
         if self._cache_idx >= len(self._mask_cache):
             self._cache_idx = 0
-            # Reshuffle order
-            import random
-            random.shuffle(self._mask_cache)
+            self._mask_cache = [
+                self._generate_block_mask_raw()
+                for _ in range(len(self._mask_cache))
+            ]
         return c, t
 
     def _generate_block_mask_raw(self) -> Tuple[torch.Tensor, torch.Tensor]:

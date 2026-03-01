@@ -41,7 +41,7 @@ def parse_args():
     # Training
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--lambda_reg", type=float, default=1.0)
 
     # Hardware

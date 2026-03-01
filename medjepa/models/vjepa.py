@@ -161,10 +161,13 @@ class VJEPA(nn.Module):
         ctx_idx = ctx_idx.to(volumes.device)
         tgt_idx = tgt_idx.to(volumes.device)
 
-        # Encode all patches
+        # Encode all patches (V-JEPA has NO EMA — single encoder for both
+        # context and target).  Unlike LeJEPA, we regularize ALL embeddings
+        # because there is no separate stable encoder to mask the variance.
+        # Target tokens are detached from pred_loss but MUST still receive
+        # gradient through the regularization path, otherwise target-side
+        # attention weights in the encoder get no learning signal at all.
         all_embeddings = self.encoder_norm(self.encoder(x))
-
-        # Separate context and target
         context_emb = all_embeddings[:, ctx_idx, :]
         target_emb = all_embeddings[:, tgt_idx, :]
 
@@ -180,7 +183,8 @@ class VJEPA(nn.Module):
         pred_output = self.predictor_norm(self.predictor(pred_input))
         predicted = self.predictor_output_proj(pred_output[:, -len(tgt_idx):, :])
 
-        # Loss
+        # Loss — regularize ALL embeddings (V-JEPA has no EMA, so all tokens
+        # come from the same encoder and need regularization to prevent collapse).
         losses = self.loss_fn(predicted, target_emb.detach(), all_embeddings)
         return losses
 

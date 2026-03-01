@@ -393,6 +393,14 @@ class MedJEPATrainer:
         self._epoch_pred_losses = []  # track pred_loss per epoch
         self._epoch_reg_losses = []   # track reg_loss per epoch
 
+        # Early stopping: stop training when loss stops improving.
+        # Saves potentially 30-50% of total wall time by avoiding
+        # unnecessary epochs after convergence.
+        self._es_patience = config.get("early_stopping_patience", 15)
+        self._es_min_delta = config.get("early_stopping_min_delta", 1e-4)
+        self._es_epochs_no_improve = 0
+        self._es_best_loss = float("inf")
+
     def _update_ema(self):
         """Update EMA target encoder with cosine momentum schedule."""
         model = self.model
@@ -710,6 +718,24 @@ class MedJEPATrainer:
                 if train_loss < best_loss:
                     best_loss = train_loss
                     self.save_checkpoint(epoch, train_loss, is_best=True)
+
+            # ---- Early stopping ----
+            if train_loss < self._es_best_loss - self._es_min_delta:
+                self._es_best_loss = train_loss
+                self._es_epochs_no_improve = 0
+            else:
+                self._es_epochs_no_improve += 1
+
+            if (self._es_patience > 0
+                    and self._es_epochs_no_improve >= self._es_patience
+                    and epoch >= self.warmup_epochs + self._es_patience):
+                if is_main_process():
+                    print(
+                        f"\n  Early stopping: no improvement for "
+                        f"{self._es_patience} epochs (best={self._es_best_loss:.6f}). "
+                        f"Stopping at epoch {epoch+1}/{num_epochs}."
+                    )
+                break
 
         if is_main_process():
             print("=" * 60)

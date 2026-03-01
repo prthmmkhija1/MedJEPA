@@ -27,7 +27,7 @@ masking:
 training:
   batch_size: 64 # How many images per step
   num_epochs: 100 # How many times to go through the full dataset
-  learning_rate: 0.001
+  learning_rate: 0.0003
   weight_decay: 0.05 # Prevents overfitting
   warmup_epochs: 10 # Slowly increase learning rate at start
   lambda_reg: 1.0 # SIGReg regularization strength

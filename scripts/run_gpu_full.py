@@ -21,7 +21,7 @@ Usage (from the MedJEPA root directory):
 Optional flags:
   --epochs 100          (default: 100)
   --batch_size 256      (default: 256, A100-40GB tuned)
-  --lr 0.0028           (default: 2.8e-3, linearly scaled for bs=256)
+  --lr 0.0003           (default: 3e-4, ViT-B SSL sweet spot for bs=256)
   --embed_dim 768       (default: 768)
   --encoder_depth 12    (default: 12)
   --predictor_depth 6   (default: 6)
@@ -251,7 +251,7 @@ def parse_args():
         "encoder_depth": 12, "predictor_depth": 6, "mask_ratio": 0.75,
         "lambda_reg": 1.0, "volume_size": [128, 128, 64],
         "vjepa_epochs": 50, "vjepa_batch_size": 4,
-        "epochs": 100, "batch_size": 256, "lr": 2.8e-3,
+        "epochs": 100, "batch_size": 256, "lr": 3e-4,
         "warmup_epochs": 10, "num_workers": 8,
         "checkpoint_dir": "checkpoints", "results_dir": "results",
         "log_every": 10, "save_every": 5,
