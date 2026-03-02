@@ -676,7 +676,7 @@ def run_lejepa_pretraining(args):
         split_encoding=_split_encoding,
         gradient_checkpointing=_grad_ckpt,
         use_ema=True,
-        ema_momentum=0.990,
+        ema_momentum=0.999,
         augmentation=aug,
     )
     total_params = sum(p.numel() for p in model.parameters())
@@ -708,6 +708,7 @@ def run_lejepa_pretraining(args):
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "compile_model": True,
         "use_prefetcher": not getattr(args, "no_prefetcher", False),
+        "ema_momentum": 0.999,  # high momentum → target encoder retains ~24% per epoch → stable targets
     }
 
     # Check for existing checkpoint to resume from

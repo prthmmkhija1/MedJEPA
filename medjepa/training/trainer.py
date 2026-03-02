@@ -343,7 +343,7 @@ class MedJEPATrainer:
                     pct_start=self.warmup_epochs / max(num_epochs, 1),
                     anneal_strategy="cos",
                     div_factor=25.0,      # start_lr = max_lr / 25
-                    final_div_factor=1e4, # end_lr  = max_lr / 1e4
+                    final_div_factor=config.get("final_div_factor", 100),  # end_lr = max_lr / 100 → 3e-6
                 )
                 self._scheduler_step_per_batch = True
                 print(f"  OneCycleLR: {total_steps} total steps, "
@@ -401,12 +401,13 @@ class MedJEPATrainer:
         self._global_step = 0
         self._grad_accum_steps = config.get("gradient_accumulation_steps", 1)
         self._tb_log_every = config.get("tb_log_every", 50)  # reduce GPU syncs
+        self._grad_clip_max_norm = config.get("grad_clip_max_norm", 1.0)
 
         # EMA momentum schedule: cosine ramp from ema_start → 1.0 over training.
         # Higher momentum later means the target encoder changes more slowly as
         # training progresses, producing increasingly stable targets.
         self._ema_start = config.get("ema_momentum", 0.996)
-        self._ema_end = 1.0
+        self._ema_end = config.get("ema_momentum_end", 1.0)
         self._total_ema_steps = (
             config.get("num_epochs", 100)
             * max(len(train_dataset) // max(config.get("batch_size", 32), 1), 1)
@@ -544,17 +545,19 @@ class MedJEPATrainer:
                     self.scaler.scale(loss).backward()
                     if (batch_idx + 1) % self._grad_accum_steps == 0:
                         self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        _gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self._grad_clip_max_norm)
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                         self._update_ema()
+                        self._last_grad_norm = _gnorm.item()
                 else:
                     # BF16 path: no scaler needed (wider dynamic range)
                     loss.backward()
                     if (batch_idx + 1) % self._grad_accum_steps == 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        _gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self._grad_clip_max_norm)
                         self.optimizer.step()
                         self._update_ema()
+                        self._last_grad_norm = _gnorm.item()
             else:
                 losses = self.model(images)
                 loss = losses["total_loss"] / self._grad_accum_steps
@@ -562,9 +565,10 @@ class MedJEPATrainer:
                 # Backward pass
                 loss.backward()
                 if (batch_idx + 1) % self._grad_accum_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    _gnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self._grad_clip_max_norm)
                     self.optimizer.step()
                     self._update_ema()
+                    self._last_grad_norm = _gnorm.item()
 
             # Track loss (avoid .item() sync on every step when possible)
             with torch.no_grad():
@@ -599,6 +603,9 @@ class MedJEPATrainer:
                 self.tb_writer.add_scalar(
                     "train/reg_loss_step",
                     losses["regularization_loss"].item(), self._global_step)
+                if hasattr(self, '_last_grad_norm'):
+                    self.tb_writer.add_scalar(
+                        "train/grad_norm", self._last_grad_norm, self._global_step)
                 # Granular reg breakdown: var_loss and cov_loss separately
                 if "variance_loss" in losses:
                     self.tb_writer.add_scalar(
@@ -705,6 +712,18 @@ class MedJEPATrainer:
                 self.tb_writer.add_scalar("train/loss_epoch", train_loss, epoch)
                 self.tb_writer.add_scalar("train/lr", lr, epoch)
                 self.tb_writer.add_scalar("train/epoch_time_s", epoch_time, epoch)
+                # Log EMA momentum to track the schedule
+                _model = self.model
+                if hasattr(_model, '_orig_mod'):
+                    _model = _model._orig_mod
+                if hasattr(_model, 'module'):
+                    _model = _model.module
+                if hasattr(_model, 'ema_momentum'):
+                    self.tb_writer.add_scalar(
+                        "train/ema_momentum", _model.ema_momentum, epoch)
+                if hasattr(self, '_last_grad_norm'):
+                    self.tb_writer.add_scalar(
+                        "train/grad_norm_epoch", self._last_grad_norm, epoch)
 
             if is_main_process():
                 print(
@@ -731,35 +750,42 @@ class MedJEPATrainer:
                     avg_pred = sum(recent_pred) / len(recent_pred)
                     avg_reg = sum(recent_reg) / len(recent_reg)
 
-                    if avg_reg < 0.005 and avg_pred < 0.0002:
+                    # With batch-wise variance, reg has a softplus floor ≈ 0.35
+                    # (never zero even with perfect variance).  Check pred_loss
+                    # directly to detect collapse.
+                    if avg_pred < 0.005:
                         # Only warn if pred_loss is truly flat/decreasing (not rising)
                         pred_rising = (len(self._epoch_pred_losses) >= 3 and
                                        self._epoch_pred_losses[-1] > self._epoch_pred_losses[-3])
                         if not pred_rising:
                             print(
-                                f"  ⚠ WARNING: Potential stagnation detected!\n"
-                                f"    pred_loss={avg_pred:.6f} (very low) and "
-                                f"reg_loss={avg_reg:.6f} (near zero).\n"
-                                f"    If pred doesn't rise in next epochs, the model "
-                                f"may not be learning meaningful features.\n"
-                                f"    Consider: lowering EMA momentum, increasing "
-                                f"lambda_reg, or checking data diversity."
+                                f"  ⚠ WARNING: Potential collapse detected!\n"
+                                f"    pred_loss={avg_pred:.6f} (very low).\n"
+                                f"    reg_loss={avg_reg:.6f} | If pred doesn't rise "
+                                f"in next epochs, the model may be learning trivial "
+                                f"features.\n"
+                                f"    Consider: increasing lambda_var, checking data "
+                                f"diversity, or lowering EMA momentum."
                             )
                         else:
                             print(
                                 f"  ✓ Healthy: pred_loss rising ({avg_pred:.6f}), "
-                                f"regularization settled ({avg_reg:.6f})"
+                                f"regularization active ({avg_reg:.6f})"
                             )
-                    elif avg_reg < 0.01 and avg_pred > 0.001:
+                    elif avg_pred > 0.05:
                         print(
-                            f"  ✓ Healthy: reg settled ({avg_reg:.4f}), "
-                            f"pred driving learning ({avg_pred:.4f})"
+                            f"  ✓ Healthy: pred driving learning ({avg_pred:.4f}), "
+                            f"reg={avg_reg:.4f}"
                         )
 
                 # Print epoch-level component breakdown
+                _gnorm_str = ""
+                if hasattr(self, '_last_grad_norm'):
+                    _gnorm_str = f" | grad_norm={self._last_grad_norm:.2f}"
                 print(
                     f"  Components: pred={_pred:.4f} | reg={_reg:.4f} "
                     f"(var={_var:.4f}, cov={_lb.get('covariance_loss', 0):.4f})"
+                    f"{_gnorm_str}"
                 )
 
             # Save checkpoint (only on main process)

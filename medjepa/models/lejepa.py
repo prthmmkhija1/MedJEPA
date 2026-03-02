@@ -62,7 +62,7 @@ class LeJEPA(nn.Module):
         split_encoding: bool = True,
         gradient_checkpointing: bool = False,
         use_ema: bool = True,
-        ema_momentum: float = 0.996,
+        ema_momentum: float = 0.999,
         multiscale_layers: int = 4,
         augmentation: nn.Module = None,
     ):

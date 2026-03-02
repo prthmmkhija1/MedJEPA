@@ -52,10 +52,14 @@ class SIGRegLoss(nn.Module):
         variance_target: float = 1.0,
         # Target standard deviation per dimension. Embeddings are pushed
         # so that each coordinate's std is close to this value.
-        lambda_var: float = 5.0,
+        lambda_var: float = 2.5,
         # Weight for the variance regularization term.
-        # 5.0 keeps the anti-collapse signal dominant over prediction loss early
-        # in training, when pred can trivially collapse to near-zero.
+        # Must be > ~1.5 to guarantee that full representation collapse is
+        # energetically unfavorable (pred_loss decrease < var_loss increase).
+        # 2.5 gives a comfortable safety margin.  In the healthy state
+        # (cross-image std ≈ 1), var contribution ≈ 2.5 × 0.14 = 0.35;
+        # during collapse (std ≈ 0) it surges to ≈ 2.5, strongly opposing
+        # the encoder's tendency to produce image-independent embeddings.
         lambda_cov: float = 0.04,
         # Weight for the off-diagonal covariance term.
     ):
@@ -101,21 +105,19 @@ class SIGRegLoss(nn.Module):
     ) -> torch.Tensor:
         """
         How different are the predictions from the actual embeddings?
-        Uses Smooth-L1 (Huber) loss on normalized embeddings — more robust
-        than pure MSE to outlier embeddings, especially early in training
-        when the EMA target encoder hasn't stabilised yet.
+        Uses MSE on raw (un-normalised) embeddings — this is the formulation
+        used in the original I-JEPA paper and provides meaningful gradients
+        throughout training.  Smooth-L1 on L2-normalised vectors compresses
+        the loss to ~0.0003 within a few epochs, starving the model of
+        learning signal.
 
         Args:
             predicted: What the predictor thinks the target embeddings are
             target: What the target embeddings actually are (from the encoder)
         """
-        # Normalize both to unit length (makes comparison direction-based, not magnitude-based)
-        predicted = F.normalize(predicted, dim=-1)
-        target = F.normalize(target, dim=-1)
-
-        # Smooth-L1: behaves like L1 for large errors (robust to outliers)
-        # and like L2 for small errors (smooth gradients near convergence)
-        loss = F.smooth_l1_loss(predicted, target, beta=0.5)
+        # Cast to float32 — bfloat16 mixed-precision can squash small
+        # differences to zero, starving the encoder of gradient signal.
+        loss = F.mse_loss(predicted.float(), target.float())
         return loss
 
     def variance_loss(
@@ -123,25 +125,32 @@ class SIGRegLoss(nn.Module):
         embeddings: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Encourage each dimension to have standard deviation close to
-        ``variance_target``.  This is the explicit anti-collapse term:
-        if any dimension's std drops to zero, this loss spikes.
+        Encourage each (position, dimension) to have non-trivial standard
+        deviation **across images in the batch** (dim=0).
 
-        Uses a hinge-style formulation: max(0, target - std(x_d)) so that
-        we only penalise dimensions whose std is *below* the target.
+        CRITICAL: the std must be computed across the BATCH dimension,
+        NOT across the flattened (batch × tokens) axis.  Flattening
+        conflates positional diversity with image diversity, masking
+        "position-only collapse" — where the encoder ignores image content
+        and outputs a fixed embedding per spatial position.  In that case
+        the cross-token std is high (different positions → different
+        embeddings) yet the representation carries zero image information.
+
+        By computing std across images for each (position, dimension), this
+        term fires exactly when all images produce the same embedding at a
+        given position — the collapse we must prevent.
+
+        Uses softplus(target - std, beta=5) so the gradient is never zero.
         """
-        batch_size, num_tokens, embed_dim = embeddings.shape
-        flat = embeddings.reshape(-1, embed_dim).float()
-        # Guard against inf/nan in embeddings (can occur early in training)
-        flat = torch.nan_to_num(flat, nan=0.0, posinf=1.0, neginf=-1.0)
+        # embeddings: (B, T, D)
+        emb = embeddings.float()
+        emb = torch.nan_to_num(emb, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Per-dimension std (unbiased=False avoids NaN when n=1)
-        std = flat.std(dim=0, unbiased=False)
-        # Replace any remaining NaN/inf std values with 0
+        # Per-(position, dimension) std across the BATCH of images
+        std = emb.std(dim=0, unbiased=False)               # (T, D)
         std = torch.nan_to_num(std, nan=0.0, posinf=0.0)
 
-        # Hinge: penalise only when std < target
-        var_loss = torch.mean(F.relu(self.variance_target - std))
+        var_loss = torch.mean(F.softplus(self.variance_target - std, beta=5.0))
         return var_loss
 
     def covariance_loss_sketched(
@@ -149,41 +158,50 @@ class SIGRegLoss(nn.Module):
         embeddings: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute the off-diagonal covariance loss in a *sketched* space.
+        Off-diagonal covariance loss computed on **mean-pooled** image
+        representations in a sketched lower-dimensional space.
 
-        1. Center the embeddings.
-        2. Project to a lower-dimensional space via random matrix R.
-        3. Compute covariance of the projected embeddings.
-        4. Penalise off-diagonal elements (push toward zero → decorrelation).
+        Embeddings are first averaged across tokens to yield one vector
+        per image (B, D).  Covariance is then computed across the batch.
+        This decorrelates the per-image representation dimensions
+        (VICReg / SIGReg formulation).
 
-        Using sketching reduces complexity from O(d^2) to O(d*k + k^2)
-        where k = sketch_dim << d.
+        Computing covariance on the flattened (B×T, D) matrix conflates
+        positional variation with cross-image variation, letting the model
+        satisfy the constraint through position-only diversity while
+        image content collapses.
+
+        Steps:
+        1. Mean-pool tokens: (B, T, D) → (B, D)
+        2. Center across batch
+        3. Sketch-project: (B, D) → (B, k)
+        4. Cov = X^T X / (B-1)
+        5. Penalise off-diagonal entries
         """
         batch_size, num_tokens, embed_dim = embeddings.shape
-        flat = embeddings.reshape(-1, embed_dim).float()
-        # Guard against inf/nan in embeddings
-        flat = torch.nan_to_num(flat, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Pool across tokens → one vector per image
+        pooled = embeddings.mean(dim=1).float()            # (B, D)
+        pooled = torch.nan_to_num(pooled, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        # Center
-        flat = flat - flat.mean(dim=0, keepdim=True)
-        n = flat.shape[0]
+        # Center across batch
+        pooled = pooled - pooled.mean(dim=0, keepdim=True)
+        n = pooled.shape[0]  # B
 
         if self.sketch_dim > 0 and self.sketch_dim < embed_dim:
             # --- Sketched covariance ---
             R = self._get_sketch_matrix(embed_dim, embeddings.device)
-            projected = flat @ R  # (n, sketch_dim)
+            projected = pooled @ R                         # (B, sketch_dim)
             k = projected.shape[1]
             cov = (projected.T @ projected) / max(n - 1, 1)  # (k, k)
         else:
             # --- Full covariance (legacy / small embed_dim) ---
             k = embed_dim
-            cov = (flat.T @ flat) / max(n - 1, 1)  # (d, d)
+            cov = (pooled.T @ pooled) / max(n - 1, 1)     # (D, D)
 
         # Off-diagonal penalty: zero out diagonal, penalise the rest
         diag = torch.diagonal(cov)
         off_diag = cov - torch.diag(diag)
         cov_loss = (off_diag ** 2).sum() / k
-        # Guard: cov can be nan if flat was all-zeros
         cov_loss = torch.nan_to_num(cov_loss, nan=0.0, posinf=0.0)
         return cov_loss
 

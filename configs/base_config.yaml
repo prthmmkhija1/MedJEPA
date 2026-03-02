@@ -25,7 +25,7 @@ masking:
 
 # --- Training ---
 training:
-  batch_size: 64 # How many images per step
+  batch_size: 256 # How many images per step (fits 12GB+ VRAM; use 64 for 8GB)
   num_epochs: 100 # How many times to go through the full dataset
   learning_rate: 0.0003
   weight_decay: 0.05 # Prevents overfitting
