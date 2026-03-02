@@ -910,7 +910,15 @@ class MedJEPATrainer:
         if hasattr(model, 'module'):           # unwrap DDP
             model = model.module
 
-        model.load_state_dict(checkpoint["model_state_dict"])
+        # strict=False: ignores shape mismatches for lazily-built buffers
+        # (e.g. loss_fn._sketch_matrix starts as empty(0), gets filled on first
+        # forward pass — a strict load would abort the entire resume for this).
+        state = checkpoint["model_state_dict"]
+        # Strip _sketch_matrix entirely — it's always rebuilt from scratch
+        state = {k: v for k, v in state.items() if "_sketch_matrix" not in k}
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            print(f"  Checkpoint load (non-fatal): missing={missing}, unexpected={unexpected}")
 
         # Restore EMA encoder state if present
         if "ema_encoder_state_dict" in checkpoint:
