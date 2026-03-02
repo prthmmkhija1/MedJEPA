@@ -150,7 +150,14 @@ class SIGRegLoss(nn.Module):
         std = emb.std(dim=0, unbiased=False)               # (T, D)
         std = torch.nan_to_num(std, nan=0.0, posinf=0.0)
 
-        var_loss = torch.mean(F.softplus(self.variance_target - std, beta=5.0))
+        # Two-sided penalty: pull std toward variance_target from BOTH directions.
+        # One-sided softplus (original) only fires at std < target, letting std
+        # grow unboundedly → var_loss → 0 → regularisation shuts off → unstable.
+        # Lower bound: penalise std < target  (anti-collapse)
+        lower = F.softplus(self.variance_target - std, beta=5.0)
+        # Upper bound: penalise std > 2×target  (anti-explosion, with headroom)
+        upper = F.softplus(std - 2.0 * self.variance_target, beta=5.0)
+        var_loss = torch.mean(lower + 0.5 * upper)
         return var_loss
 
     def covariance_loss_sketched(

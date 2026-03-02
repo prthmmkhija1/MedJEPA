@@ -115,12 +115,7 @@ def main():
         config=config,
     )
 
-    # Resume from checkpoint if specified
-    if args.resume:
-        print(f"\nResuming from: {args.resume}")
-        trainer.load_checkpoint(args.resume)
-
-    history = trainer.train()
+    history = trainer.train(resume_checkpoint=args.resume if args.resume else None)
 
     # Save training history
     import json

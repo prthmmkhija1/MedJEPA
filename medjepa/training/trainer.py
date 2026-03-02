@@ -773,10 +773,26 @@ class MedJEPATrainer:
                                 f"regularization active ({avg_reg:.6f})"
                             )
                     elif avg_pred > 0.05:
-                        print(
-                            f"  ✓ Healthy: pred driving learning ({avg_pred:.4f}), "
-                            f"reg={avg_reg:.4f}"
-                        )
+                        # Check whether pred_loss is trending upward (bad) or stable/down
+                        pred_trend_up = (len(self._epoch_pred_losses) >= 5 and
+                                         self._epoch_pred_losses[-1] > self._epoch_pred_losses[-5] * 1.3)
+                        var_near_zero = (_var < 0.01)
+                        if pred_trend_up and var_near_zero:
+                            print(
+                                f"  ⚠ WARNING: Possible representation explosion!\n"
+                                f"    pred_loss trending UP ({self._epoch_pred_losses[-5]:.4f} → "
+                                f"{self._epoch_pred_losses[-1]:.4f}) while var_loss≈0 "
+                                f"(std >> target).\n"
+                                f"    Regularisation is inactive. Embeddings may have "
+                                f"exploded in scale, making targets hard to predict.\n"
+                                f"    Consider: resuming from epoch-7 checkpoint and "
+                                f"increasing lambda_var or adding embedding norm clipping."
+                            )
+                        else:
+                            print(
+                                f"  ✓ Healthy: pred driving learning ({avg_pred:.4f}), "
+                                f"reg={avg_reg:.4f}"
+                            )
 
                 # Print epoch-level component breakdown
                 _gnorm_str = ""
