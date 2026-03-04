@@ -943,8 +943,37 @@ def run_vjepa_pretraining(args):
         except ImportError:
             pass
 
-    print(f"\nStarting V-JEPA training for {args.vjepa_epochs} epochs...")
-    for epoch in range(args.vjepa_epochs):
+    # ── Resume from existing V-JEPA checkpoint ──
+    # Prefer last_vjepa_checkpoint.pt (true last epoch) over best_vjepa_model.pt
+    start_epoch = 0
+    _resume_candidates = [
+        ckpt_dir / "last_vjepa_checkpoint.pt",
+        ckpt_dir / "best_vjepa_model.pt",
+    ]
+    for vjepa_ckpt_path in _resume_candidates:
+        if vjepa_ckpt_path.exists():
+            try:
+                vjepa_resume = torch.load(str(vjepa_ckpt_path), map_location=device, weights_only=False)
+                model.load_state_dict(vjepa_resume["model_state_dict"], strict=False)
+                if "optimizer_state_dict" in vjepa_resume:
+                    optimizer.load_state_dict(vjepa_resume["optimizer_state_dict"])
+                if "scheduler_state_dict" in vjepa_resume:
+                    scheduler.load_state_dict(vjepa_resume["scheduler_state_dict"])
+                start_epoch = vjepa_resume.get("epoch", 0)  # 1-based: next epoch to run
+                best_loss = vjepa_resume.get("best_loss", vjepa_resume.get("loss", best_loss))
+                print(f"  Resumed V-JEPA from {vjepa_ckpt_path.name}: "
+                      f"epoch {start_epoch}, best loss {best_loss:.4f}")
+                break
+            except Exception as e:
+                print(f"  Could not resume from {vjepa_ckpt_path.name}: {e}")
+                start_epoch = 0
+
+    if start_epoch >= args.vjepa_epochs:
+        print(f"  V-JEPA already completed {start_epoch}/{args.vjepa_epochs} epochs. Skipping.")
+        return str(ckpt_dir / "best_vjepa_model.pt")
+
+    print(f"\nStarting V-JEPA training for {args.vjepa_epochs} epochs (from epoch {start_epoch+1})...")
+    for epoch in range(start_epoch, args.vjepa_epochs):
         model.train()
         epoch_losses = []
 
@@ -990,21 +1019,27 @@ def run_vjepa_pretraining(args):
             tb_writer.add_scalar("vjepa/loss_epoch", avg_loss, epoch)
             tb_writer.add_scalar("vjepa/lr", lr, epoch)
 
+        _vjepa_ckpt_payload = {
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "loss": avg_loss,
+            "best_loss": best_loss,
+            "config": {
+                "embed_dim": args.embed_dim,
+                "encoder_depth": args.encoder_depth,
+                "predictor_depth": args.predictor_depth,
+                "volume_size": list(volume_size),
+            },
+        }
+        # Always overwrite last checkpoint so resume starts from the true final epoch
+        torch.save(_vjepa_ckpt_payload, ckpt_dir / "last_vjepa_checkpoint.pt")
+
         if avg_loss < best_loss:
             best_loss = avg_loss
-            save_path = ckpt_dir / "best_vjepa_model.pt"
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": best_loss,
-                "config": {
-                    "embed_dim": args.embed_dim,
-                    "encoder_depth": args.encoder_depth,
-                    "predictor_depth": args.predictor_depth,
-                    "volume_size": list(volume_size),
-                },
-            }, save_path)
+            _vjepa_ckpt_payload["best_loss"] = best_loss
+            torch.save(_vjepa_ckpt_payload, ckpt_dir / "best_vjepa_model.pt")
 
     if tb_writer is not None:
         tb_writer.close()
@@ -1041,7 +1076,9 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         predictor_depth=predictor_depth,
         use_ema=True,
     )
-    lejepa.load_state_dict(ckpt["model_state_dict"], strict=False)
+    # Strip _sketch_matrix buffer (lazily-built, causes size mismatch on load)
+    state = {k: v for k, v in ckpt["model_state_dict"].items() if "_sketch_matrix" not in k}
+    lejepa.load_state_dict(state, strict=False)
     # Load EMA encoder weights if available (used for inference)
     if "ema_encoder_state_dict" in ckpt:
         lejepa.ema_encoder.load_state_dict(ckpt["ema_encoder_state_dict"])
@@ -1214,7 +1251,9 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 embed_dim=embed_dim, encoder_depth=encoder_depth,
                 predictor_depth=predictor_depth, use_ema=True,
             )
-            ft_model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            # Strip _sketch_matrix buffer (lazily-built, causes size mismatch)
+            ft_state = {k: v for k, v in ckpt["model_state_dict"].items() if "_sketch_matrix" not in k}
+            ft_model.load_state_dict(ft_state, strict=False)
             if "ema_encoder_state_dict" in ckpt:
                 ft_model.ema_encoder.load_state_dict(ckpt["ema_encoder_state_dict"])
             ft_model = ft_model.to(device)
