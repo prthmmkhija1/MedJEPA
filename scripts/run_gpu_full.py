@@ -1168,6 +1168,14 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         print(f"\n[{name}] N-Shot Classification (5/10/20-shot) ...")
         n_shot_results = {}
         unique_classes = torch.unique(train_labels)
+        # Subsample test features for kNN if dataset is very large
+        _nshot_test_feats = test_feats
+        _nshot_test_labels = test_labels
+        if len(test_labels) > 20000:
+            _rng = np.random.RandomState(42)
+            _idx = _rng.choice(len(test_labels), 20000, replace=False)
+            _nshot_test_feats = test_feats[_idx]
+            _nshot_test_labels = test_labels[_idx]
         for n_shot in [5, 10, 20]:
             # Sample n_shot examples per class from training features
             support_idx = []
@@ -1185,10 +1193,10 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             from sklearn.neighbors import KNeighborsClassifier
             from sklearn.metrics import accuracy_score
             k = min(5, len(support_labs))
-            knn = KNeighborsClassifier(n_neighbors=max(1, k))
+            knn = KNeighborsClassifier(n_neighbors=max(1, k), algorithm='ball_tree')
             knn.fit(support_feats.numpy(), support_labs.numpy())
-            preds = knn.predict(test_feats.numpy())
-            acc = accuracy_score(test_labels.numpy(), preds)
+            preds = knn.predict(_nshot_test_feats.numpy())
+            acc = accuracy_score(_nshot_test_labels.numpy(), preds)
             n_shot_results[f"{n_shot}-shot"] = {
                 "accuracy": acc,
                 "num_support": len(support_labs),
@@ -1264,6 +1272,12 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         print(f"\n[{name}] Full Fine-Tuning ...")
         ft_results = {"accuracy": None, "auc": None}
         try:
+            # Free extracted features before fine-tuning to reclaim memory
+            # (_nshot_* may alias test_feats/test_labels so delete both)
+            del train_feats, test_feats, train_labels, test_labels
+            del _nshot_test_feats, _nshot_test_labels
+            gc.collect()
+
             # Move LeJEPA to CPU to free GPU for the fine-tune copy
             lejepa.cpu()
             if torch.cuda.is_available():

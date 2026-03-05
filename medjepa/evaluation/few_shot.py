@@ -82,6 +82,7 @@ class FewShotEvaluator:
         test_features: torch.Tensor,
         test_labels: torch.Tensor,
         fractions: list = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
+        max_test_samples: int = 20000,
     ) -> list:
         """
         Test with different amounts of labeled data.
@@ -89,13 +90,22 @@ class FewShotEvaluator:
 
         Args:
             fractions: What percentage of labels to use (0.01 = 1%, 0.5 = 50%)
+            max_test_samples: Cap test set size for kNN to avoid memory issues
         """
         results = []
         rng = np.random.RandomState(42)  # Fixed seed for reproducibility
 
+        # Subsample test set if too large (kNN distance matrix can be huge)
+        if len(test_labels) > max_test_samples:
+            test_idx = rng.choice(len(test_labels), max_test_samples, replace=False)
+            test_features = test_features[test_idx]
+            test_labels = test_labels[test_idx]
+
         for frac in fractions:
             n = max(1, int(len(full_train_labels) * frac))
-            indices = rng.choice(len(full_train_labels), n, replace=False)
+            # Also cap training samples for kNN to avoid memory blowup
+            max_train = min(n, 50000)
+            indices = rng.choice(len(full_train_labels), max_train, replace=False)
 
             subset_features = full_train_features[indices].numpy()
             subset_labels = full_train_labels[indices].numpy()
@@ -105,7 +115,7 @@ class FewShotEvaluator:
             # kNN needs at least 1 neighbor
             n_neighbors = max(1, n_neighbors)
 
-            knn = KNeighborsClassifier(n_neighbors=n_neighbors)
+            knn = KNeighborsClassifier(n_neighbors=n_neighbors, algorithm='ball_tree')
             knn.fit(subset_features, subset_labels)
             predictions = knn.predict(test_features.numpy())
             accuracy = accuracy_score(test_labels.numpy(), predictions)

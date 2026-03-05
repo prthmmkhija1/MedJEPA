@@ -47,8 +47,9 @@ class FineTuneEvaluator:
         encoder_lr: float = 1e-5,
         head_lr: float = 1e-3,
         num_epochs: int = 30,
-        batch_size: int = 64,
+        batch_size: int = 16,
         weight_decay: float = 0.01,
+        grad_accum_steps: int = 4,
     ):
         self.device = get_device()
         self.model = pretrained_model.to(self.device)
@@ -59,6 +60,7 @@ class FineTuneEvaluator:
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.weight_decay = weight_decay
+        self.grad_accum_steps = grad_accum_steps
 
         # Classification head
         self.head = nn.Sequential(
@@ -81,6 +83,17 @@ class FineTuneEvaluator:
                 all_labels.append(labels)
         return torch.cat(all_features), torch.cat(all_labels)
 
+    def _rewrap_loader(self, loader: DataLoader) -> DataLoader:
+        """Re-wrap a DataLoader with the fine-tuning batch size."""
+        return DataLoader(
+            loader.dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=min(getattr(loader, 'num_workers', 0), 2),
+            pin_memory=torch.cuda.is_available(),
+            drop_last=False,
+        )
+
     def train(
         self,
         train_loader: DataLoader,
@@ -89,9 +102,14 @@ class FineTuneEvaluator:
         """
         Fine-tune encoder + head end-to-end.
 
+        Uses gradient accumulation and small batch size to avoid OOM.
+
         Returns:
             dict with training history (losses, val accuracies).
         """
+        # Re-wrap loaders with smaller batch size for fine-tuning
+        train_loader = self._rewrap_loader(train_loader)
+
         # Unfreeze encoder
         for p in self.model.parameters():
             p.requires_grad = True
@@ -120,24 +138,27 @@ class FineTuneEvaluator:
             epoch_loss = 0.0
             n_batches = 0
 
-            for batch in train_loader:
+            optimizer.zero_grad()
+            for step, batch in enumerate(train_loader):
                 images, labels = batch[0].to(self.device), batch[1].to(self.device)
 
-                optimizer.zero_grad()
                 # Use gradient-enabled encode for fine-tuning
                 if hasattr(self.model, 'encode_with_grad'):
                     features = self.model.encode_with_grad(images)
                 else:
                     features = self.model.encode(images)
                 logits = self.head(features)
-                loss = criterion(logits, labels)
+                loss = criterion(logits, labels) / self.grad_accum_steps
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    list(encoder_params) + head_params, max_norm=1.0,
-                )
-                optimizer.step()
 
-                epoch_loss += loss.item()
+                if (step + 1) % self.grad_accum_steps == 0 or (step + 1) == len(train_loader):
+                    torch.nn.utils.clip_grad_norm_(
+                        list(encoder_params) + head_params, max_norm=1.0,
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                epoch_loss += loss.item() * self.grad_accum_steps
                 n_batches += 1
 
             scheduler.step()
@@ -170,9 +191,14 @@ class FineTuneEvaluator:
     def _evaluate_loader(self, loader: DataLoader) -> float:
         self.model.eval()
         self.head.eval()
+        eval_loader = DataLoader(
+            loader.dataset, batch_size=self.batch_size * 4,
+            num_workers=min(getattr(loader, 'num_workers', 0), 2),
+            pin_memory=torch.cuda.is_available(),
+        )
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for images, labels in loader:
+            for images, labels in eval_loader:
                 images = images.to(self.device)
                 features = self.model.encode(images)
                 logits = self.head(features)
@@ -211,7 +237,7 @@ class FineTuneEvaluator:
 
         results = {
             "accuracy": float(accuracy_score(labels, preds)),
-            "report": classification_report(labels, preds, output_dict=True),
+            "report": classification_report(labels, preds, output_dict=True, zero_division=0),
         }
 
         try:
@@ -348,7 +374,7 @@ class ImageNetBaselineEvaluator:
 
         results = {
             "accuracy": float(accuracy_score(labels, preds)),
-            "report": classification_report(labels, preds, output_dict=True),
+            "report": classification_report(labels, preds, output_dict=True, zero_division=0),
         }
 
         try:

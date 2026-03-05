@@ -275,6 +275,10 @@ class LeJEPA(nn.Module):
         Unlike encode() which wraps in torch.no_grad(), this allows gradients
         to flow through the encoder so it can be updated during fine-tuning.
         Always uses the online encoder (not EMA) since we want to update it.
+
+        Memory-optimized: only keeps the last N layer outputs needed for
+        multi-scale pooling, discarding earlier layers to reduce peak VRAM.
+        Uses gradient checkpointing when available.
         """
         encoder = self.encoder  # online encoder for fine-tuning
 
@@ -282,13 +286,21 @@ class LeJEPA(nn.Module):
             x = encoder.patch_embed(images)
             x = x + encoder.pos_embed
 
-            layer_outputs = []
-            for block in encoder.blocks:
-                x = block(x)
-                layer_outputs.append(x)
+            n = min(self.multiscale_layers, len(encoder.blocks))
+            # Only keep the last n layer outputs to save memory
+            num_blocks = len(encoder.blocks)
+            start_collecting = num_blocks - n
 
-            n = min(self.multiscale_layers, len(layer_outputs))
-            stacked = torch.stack(layer_outputs[-n:], dim=0)
+            layer_outputs = []
+            for i, block in enumerate(encoder.blocks):
+                if torch.is_grad_enabled() and hasattr(torch.utils, 'checkpoint'):
+                    x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+                else:
+                    x = block(x)
+                if i >= start_collecting:
+                    layer_outputs.append(x)
+
+            stacked = torch.stack(layer_outputs, dim=0)
             pooled = stacked.mean(dim=0)
             pooled = encoder.norm(pooled)
             return pooled.mean(dim=1)

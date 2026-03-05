@@ -168,7 +168,7 @@ class LinearProbeEvaluator:
         results = {
             "accuracy": float(accuracy_score(true_labels, predictions)),
             "report": classification_report(
-                true_labels, predictions, output_dict=True,
+                true_labels, predictions, output_dict=True, zero_division=0,
             ),
         }
 
