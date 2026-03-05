@@ -46,6 +46,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 
+import gc
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, ConcatDataset, random_split
@@ -347,6 +348,8 @@ def parse_args():
                    help="Trade ~33%% extra compute for ~2x memory savings (allows bigger batch)")
     p.add_argument("--no_prefetcher", action="store_true",
                    help="Disable CUDA stream prefetcher")
+    p.add_argument("--skip_imagenet", action="store_true",
+                   help="Skip ImageNet ViT-B/16 baseline (avoids OOM/segfault on low-VRAM GPUs)")
 
     raw = p.parse_args()
 
@@ -1222,30 +1225,51 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             torch.cuda.empty_cache()
 
         # ImageNet Pretrained Baseline (ViT-B/16)
-        print(f"\n[{name}] ImageNet ViT-B/16 Baseline ...")
         inet_results = {"accuracy": None, "auc": None}
-        try:
-            inet_eval = ImageNetBaselineEvaluator(
-                num_classes=num_classes, backbone="vit_b_16",
-            )
-            inet_train_feats, inet_train_labs = inet_eval.extract_features(train_loader)
-            inet_test_feats, inet_test_labs = inet_eval.extract_features(test_loader)
-            inet_eval.train_probe(inet_train_feats, inet_train_labs)
-            inet_results = inet_eval.evaluate(inet_test_feats, inet_test_labs)
-            print(f"  ImageNet Baseline Accuracy: {inet_results['accuracy']:.4f}")
-            print(f"  MedJEPA LP Accuracy:        {lp_results['accuracy']:.4f}")
-            inet_imp = lp_results['accuracy'] - inet_results['accuracy']
-            print(f"  MedJEPA vs ImageNet:        {inet_imp:+.4f}")
-            del inet_eval
-        except Exception as e:
-            print(f"  ImageNet baseline failed: {e}")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if getattr(args, 'skip_imagenet', False):
+            print(f"\n[{name}] ImageNet ViT-B/16 Baseline ... SKIPPED (--skip_imagenet)")
+        else:
+            print(f"\n[{name}] ImageNet ViT-B/16 Baseline ...")
+            try:
+                # Move LeJEPA to CPU first to free GPU memory — loading a
+                # second ViT on the same GPU can trigger a CUDA segfault.
+                lejepa.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+                inet_eval = ImageNetBaselineEvaluator(
+                    num_classes=num_classes, backbone="vit_b_16",
+                )
+                inet_train_feats, inet_train_labs = inet_eval.extract_features(train_loader)
+                inet_test_feats, inet_test_labs = inet_eval.extract_features(test_loader)
+                inet_eval.train_probe(inet_train_feats, inet_train_labs)
+                inet_results = inet_eval.evaluate(inet_test_feats, inet_test_labs)
+                print(f"  ImageNet Baseline Accuracy: {inet_results['accuracy']:.4f}")
+                print(f"  MedJEPA LP Accuracy:        {lp_results['accuracy']:.4f}")
+                inet_imp = lp_results['accuracy'] - inet_results['accuracy']
+                print(f"  MedJEPA vs ImageNet:        {inet_imp:+.4f}")
+                del inet_eval
+            except Exception as e:
+                print(f"  ImageNet baseline failed: {e}")
+                import traceback; traceback.print_exc()
+            finally:
+                # Always restore LeJEPA back to GPU
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                lejepa.to(device)
 
         # Full Fine-Tuning (end-to-end, encoder + classification head)
         print(f"\n[{name}] Full Fine-Tuning ...")
         ft_results = {"accuracy": None, "auc": None}
         try:
+            # Move LeJEPA to CPU to free GPU for the fine-tune copy
+            lejepa.cpu()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
             ft_model = LeJEPA(
                 image_size=image_size, patch_size=patch_size,
                 embed_dim=embed_dim, encoder_depth=encoder_depth,
@@ -1274,8 +1298,11 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         except Exception as e:
             print(f"  Fine-tuning failed: {e}")
             import traceback; traceback.print_exc()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            lejepa.to(device)
 
         all_results[name] = {
             "type": "classification",
@@ -1300,6 +1327,14 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 "auc": ft_results.get("auc"),
             },
         }
+
+        # Save partial results after each dataset (crash-safe)
+        _partial_dir = Path(args.results_dir)
+        _partial_dir.mkdir(parents=True, exist_ok=True)
+        _partial_path = _partial_dir / "evaluation_results_partial.json"
+        with open(_partial_path, "w") as _pf:
+            json.dump(all_results, _pf, indent=2, default=str)
+        print(f"  [Saved partial results to {_partial_path}]")
 
     # -- Evaluate 3D datasets (as 2D slices through LeJEPA) --
     for name, cfg in DATASETS_3D.items():
@@ -1448,6 +1483,14 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 "auc": bl_results.get("auc"),
             },
         }
+
+        # Save partial results after each 3D dataset (crash-safe)
+        _partial_dir = Path(args.results_dir)
+        _partial_dir.mkdir(parents=True, exist_ok=True)
+        _partial_path = _partial_dir / "evaluation_results_partial.json"
+        with open(_partial_path, "w") as _pf:
+            json.dump(all_results, _pf, indent=2, default=str)
+        print(f"  [Saved partial results to {_partial_path}]")
 
     # -- Segmentation evaluation (Dice Score on BraTS 2D slices via LeJEPA) --
     banner("Segmentation Evaluation (Dice Score)")

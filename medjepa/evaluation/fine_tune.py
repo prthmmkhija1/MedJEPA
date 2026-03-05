@@ -14,6 +14,7 @@ Two additional evaluation strategies beyond linear probing:
    features.
 """
 
+import gc
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -285,6 +286,7 @@ class ImageNetBaselineEvaluator:
     def extract_features(self, dataloader: DataLoader):
         """Extract features from the ImageNet backbone."""
         all_features, all_labels = [], []
+        self.backbone.to(self.device)
         with torch.no_grad():
             for images, labels in dataloader:
                 images = images.to(self.device)
@@ -293,6 +295,11 @@ class ImageNetBaselineEvaluator:
                     features = features.mean(dim=1)
                 all_features.append(features.cpu())
                 all_labels.append(labels)
+        # Move backbone to CPU immediately after extraction to free GPU
+        self.backbone.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
         return torch.cat(all_features), torch.cat(all_labels)
 
     def train_probe(
