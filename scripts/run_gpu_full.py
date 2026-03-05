@@ -411,6 +411,85 @@ def parse_args():
 # Helpers
 # ===============================================================
 
+import subprocess
+import tempfile
+
+
+def _run_eval_subprocess(task: str, config_data: dict, timeout: int = 1800) -> dict:
+    """
+    Run an evaluation task in an isolated subprocess.
+
+    This prevents CUDA segfaults (signal 11) from killing the main pipeline.
+    The subprocess gets its own fresh CUDA context; if it crashes, only the
+    child dies and the parent continues with the next evaluation.
+
+    Args:
+        task: "imagenet_baseline" or "fine_tuning"
+        config_data: serializable dict with dataset/model configuration
+        timeout: seconds before the subprocess is killed
+
+    Returns:
+        dict with results, or {"error": "..."} on failure.
+    """
+    config_fd, config_path = tempfile.mkstemp(suffix="_eval_cfg.json")
+    result_fd, result_path = tempfile.mkstemp(suffix="_eval_res.json")
+    os.close(config_fd)
+    os.close(result_fd)
+
+    try:
+        with open(config_path, "w") as f:
+            json.dump(config_data, f)
+
+        worker_script = str(PROJECT_ROOT / "scripts" / "_eval_worker.py")
+        proc = subprocess.run(
+            [sys.executable, worker_script,
+             "--task", task,
+             "--config", config_path,
+             "--result", result_path],
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+        )
+
+        # Print subprocess stdout (it contains progress messages)
+        if proc.stdout:
+            for line in proc.stdout.strip().split("\n"):
+                print(line)
+
+        if proc.returncode == 0 and os.path.exists(result_path):
+            with open(result_path) as f:
+                content = f.read().strip()
+                if content:
+                    return json.loads(content)
+        # Non-zero exit
+        stderr_tail = (proc.stderr or "")[-500:]
+        return {"error": f"subprocess exited with code {proc.returncode}",
+                "stderr": stderr_tail}
+
+    except subprocess.TimeoutExpired:
+        return {"error": "subprocess timed out"}
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        for p in (config_path, result_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def _resolve_subset_indices(dataset):
+    """Walk nested Subset wrappers to get absolute indices into the root dataset."""
+    if not hasattr(dataset, "indices"):
+        return list(range(len(dataset)))
+    indices = list(dataset.indices)
+    ds = dataset.dataset
+    while isinstance(ds, torch.utils.data.Subset):
+        indices = [ds.indices[i] for i in indices]
+        ds = ds.dataset
+    return indices
+
+
 def banner(text: str):
     print("\n" + "=" * 60)
     print(text)
@@ -1229,94 +1308,99 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         print(f"  Improvement:       {improvement:+.4f}")
 
         del baseline_model  # free memory
+        # Free ALL baseline GPU objects to maximise room for next evaluations
+        del baseline_lp, lp
+        del baseline_train_feats, baseline_test_feats
+        del baseline_train_labels, baseline_test_labels
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # ImageNet Pretrained Baseline (ViT-B/16)
+        # ── Collect train/test indices for subprocess evaluations ──
+        # Resolve through any nested Subset wrappers (e.g. max_samples)
+        # so the subprocess can load the raw dataset and use absolute indices.
+        _train_indices = _resolve_subset_indices(train_ds)
+        _test_indices = _resolve_subset_indices(test_ds)
+
+        # ImageNet Pretrained Baseline (ViT-B/16) — run in subprocess
+        # to isolate CUDA segfaults (signal 11) that kill the process.
         inet_results = {"accuracy": None, "auc": None}
         if getattr(args, 'skip_imagenet', False):
             print(f"\n[{name}] ImageNet ViT-B/16 Baseline ... SKIPPED (--skip_imagenet)")
         else:
-            print(f"\n[{name}] ImageNet ViT-B/16 Baseline ...")
-            try:
-                # Move LeJEPA to CPU first to free GPU memory — loading a
-                # second ViT on the same GPU can trigger a CUDA segfault.
-                lejepa.cpu()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-
-                inet_eval = ImageNetBaselineEvaluator(
-                    num_classes=num_classes, backbone="vit_b_16",
-                )
-                inet_train_feats, inet_train_labs = inet_eval.extract_features(train_loader)
-                inet_test_feats, inet_test_labs = inet_eval.extract_features(test_loader)
-                inet_eval.train_probe(inet_train_feats, inet_train_labs)
-                inet_results = inet_eval.evaluate(inet_test_feats, inet_test_labs)
-                print(f"  ImageNet Baseline Accuracy: {inet_results['accuracy']:.4f}")
-                print(f"  MedJEPA LP Accuracy:        {lp_results['accuracy']:.4f}")
-                inet_imp = lp_results['accuracy'] - inet_results['accuracy']
-                print(f"  MedJEPA vs ImageNet:        {inet_imp:+.4f}")
-                del inet_eval
-            except Exception as e:
-                print(f"  ImageNet baseline failed: {e}")
-                import traceback; traceback.print_exc()
-            finally:
-                # Always restore LeJEPA back to GPU
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-                lejepa.to(device)
-
-        # Full Fine-Tuning (end-to-end, encoder + classification head)
-        print(f"\n[{name}] Full Fine-Tuning ...")
-        ft_results = {"accuracy": None, "auc": None}
-        try:
-            # Free extracted features before fine-tuning to reclaim memory
-            # (_nshot_* may alias test_feats/test_labels so delete both)
-            del train_feats, test_feats, train_labels, test_labels
-            del _nshot_test_feats, _nshot_test_labels
-            gc.collect()
-
-            # Move LeJEPA to CPU to free GPU for the fine-tune copy
+            print(f"\n[{name}] ImageNet ViT-B/16 Baseline ... (subprocess)")
+            # Move LeJEPA to CPU so subprocess gets the full GPU
             lejepa.cpu()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
 
-            ft_model = LeJEPA(
-                image_size=image_size, patch_size=patch_size,
-                embed_dim=embed_dim, encoder_depth=encoder_depth,
-                predictor_depth=predictor_depth, use_ema=True,
-            )
-            # Strip _sketch_matrix buffer (lazily-built, causes size mismatch)
-            ft_state = {k: v for k, v in ckpt["model_state_dict"].items() if "_sketch_matrix" not in k}
-            ft_model.load_state_dict(ft_state, strict=False)
-            if "ema_encoder_state_dict" in ckpt:
-                ft_model.ema_encoder.load_state_dict(ckpt["ema_encoder_state_dict"])
-            ft_model = ft_model.to(device)
+            inet_cfg = {
+                "name": name, "dataset_cfg": cfg,
+                "image_size": image_size, "num_classes": num_classes,
+                "batch_size": args.batch_size, "num_workers": args.num_workers,
+                "max_samples": args.max_samples,
+                "train_indices": _train_indices,
+                "test_indices": _test_indices,
+            }
+            inet_sub = _run_eval_subprocess("imagenet_baseline", inet_cfg, timeout=1800)
+            if inet_sub and "error" not in inet_sub:
+                inet_results = inet_sub
+                print(f"  MedJEPA LP Accuracy:        {lp_results['accuracy']:.4f}")
+                inet_imp = lp_results['accuracy'] - inet_results['accuracy']
+                print(f"  MedJEPA vs ImageNet:        {inet_imp:+.4f}")
+            else:
+                err_msg = inet_sub.get("error", "unknown") if inet_sub else "crashed"
+                print(f"  ImageNet baseline failed: {err_msg}")
 
-            _multi_label_ft = (name == "chestxray14")
-            ft_eval = FineTuneEvaluator(
-                pretrained_model=ft_model,
-                num_classes=num_classes,
-                embed_dim=embed_dim,
-                num_epochs=20,
-            )
-            ft_history = ft_eval.train(train_loader, test_loader)
-            ft_results = ft_eval.evaluate(test_loader)
-            print(f"  Fine-Tune Accuracy: {ft_results['accuracy']:.4f}")
-            if ft_results.get("auc"):
-                print(f"  Fine-Tune AUC:      {ft_results['auc']:.4f}")
-            del ft_model, ft_eval
-        except Exception as e:
-            print(f"  Fine-tuning failed: {e}")
-            import traceback; traceback.print_exc()
-        finally:
+            # Restore LeJEPA to GPU
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
             lejepa.to(device)
+
+        # Full Fine-Tuning — run in subprocess to isolate OOM/crashes
+        print(f"\n[{name}] Full Fine-Tuning ... (subprocess)")
+        ft_results = {"accuracy": None, "auc": None}
+        # Free extracted features before fine-tuning to reclaim memory
+        try:
+            del train_feats, test_feats, train_labels, test_labels
+        except NameError:
+            pass
+        try:
+            del _nshot_test_feats, _nshot_test_labels
+        except NameError:
+            pass
+        gc.collect()
+
+        lejepa.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        ft_cfg = {
+            "name": name, "dataset_cfg": cfg,
+            "image_size": image_size, "num_classes": num_classes,
+            "batch_size": args.batch_size, "num_workers": args.num_workers,
+            "max_samples": args.max_samples,
+            "train_indices": _train_indices,
+            "test_indices": _test_indices,
+            "patch_size": patch_size, "embed_dim": embed_dim,
+            "encoder_depth": encoder_depth, "predictor_depth": predictor_depth,
+            "checkpoint_path": str(lejepa_ckpt),
+        }
+        ft_sub = _run_eval_subprocess("fine_tuning", ft_cfg, timeout=3600)
+        if ft_sub and "error" not in ft_sub:
+            ft_results = ft_sub
+        else:
+            err_msg = ft_sub.get("error", "unknown") if ft_sub else "crashed"
+            print(f"  Fine-tuning failed: {err_msg}")
+
+        # Restore LeJEPA to GPU for next dataset
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        lejepa.to(device)
 
         all_results[name] = {
             "type": "classification",
