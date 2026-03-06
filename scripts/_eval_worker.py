@@ -66,7 +66,25 @@ def run_imagenet_baseline(cfg):
     )
     inet_train_feats, inet_train_labs = inet_eval.extract_features(train_loader)
     inet_test_feats, inet_test_labs = inet_eval.extract_features(test_loader)
+
+    # Phase 1 done: feature extraction complete.
+    # Free the backbone (~330 MB), dataset, and loaders immediately —
+    # only the lightweight probe + extracted feature tensors are needed now.
+    del inet_eval.backbone
+    inet_eval.backbone = None
+    del train_loader, test_loader, train_ds, test_ds, ds
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Phase 2: train the linear probe (only needs train features)
     inet_eval.train_probe(inet_train_feats, inet_train_labs)
+
+    # Free train features — only test features needed for evaluation
+    del inet_train_feats, inet_train_labs
+    gc.collect()
+
+    # Phase 3: evaluate
     inet_results = inet_eval.evaluate(inet_test_feats, inet_test_labs)
 
     print(f"  ImageNet Baseline Accuracy: {inet_results['accuracy']:.4f}")
@@ -76,11 +94,8 @@ def run_imagenet_baseline(cfg):
     # Strip non-serializable report
     inet_results.pop("report", None)
 
-    # Explicit cleanup — free all large tensors before the subprocess exits
-    # to avoid peak-memory overlap with the parent process.
-    del inet_eval, inet_train_feats, inet_train_labs
-    del inet_test_feats, inet_test_labs
-    del train_loader, test_loader, train_ds, test_ds, ds
+    # Final cleanup
+    del inet_eval, inet_test_feats, inet_test_labs
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

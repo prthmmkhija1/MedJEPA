@@ -1423,7 +1423,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             del _nshot_test_feats, _nshot_test_labels_1d
         except NameError:
             pass
-        del train_loader, test_loader, train_ds, test_ds
+        del train_loader, test_loader, train_ds, test_ds, ds
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
