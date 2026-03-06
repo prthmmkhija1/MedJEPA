@@ -1335,6 +1335,12 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
 
         num_classes = cfg["num_classes"]
 
+        # Lazy-restore LeJEPA to GPU (it may have been left on CPU after previous subprocess)
+        if next(lejepa.parameters()).device.type == "cpu":
+            lejepa.to(device)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         # Linear Probe
         print(f"\n[{name}] Linear Probing ...")
         _multi_label = (name == "chestxray14")
@@ -1505,11 +1511,8 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 err_msg = inet_sub.get("error", "unknown") if inet_sub else "crashed"
                 print(f"  ImageNet baseline failed: {err_msg}")
 
-            # Restore LeJEPA to GPU
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-            lejepa.to(device)
+            # Do NOT restore LeJEPA to GPU here — fine-tuning subprocess is next
+            # and will immediately call lejepa.cpu() again anyway.
 
         # ── Save partial results NOW (before fine-tuning subprocess) ──
         # Linear probe / few-shot / n-shot / baselines are already complete.
@@ -1572,11 +1575,11 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 err_msg = ft_sub.get("error", "unknown") if ft_sub else "crashed"
                 print(f"  Fine-tuning failed: {err_msg}")
 
-            # Restore LeJEPA to GPU for next dataset
+            # Do NOT restore LeJEPA to GPU here.
+            # It will be moved to GPU lazily at the start of the next dataset.
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            gc.collect()
-            lejepa.to(device)
 
         # Update fine-tuning result and save final partial results
         all_results[name]["fine_tuning"] = {
