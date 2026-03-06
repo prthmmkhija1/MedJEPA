@@ -45,7 +45,17 @@ import yaml  # for loading base_config.yaml
 # -- Ensure project root is importable --
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+# Also allow importing sibling scripts (e.g. _eval_worker)
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 os.chdir(PROJECT_ROOT)
+
+# Import worker functions for in-process evaluation (no subprocess).
+# Calling these directly in the main process avoids spawning a second Python
+# interpreter — which would ~double the RSS and trigger the OOM killer on
+# memory-constrained containers.
+from _eval_worker import run_imagenet_baseline, run_fine_tuning
 
 import gc
 import torch
@@ -1487,9 +1497,9 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         _test_indices = _resolve_subset_indices(test_ds)
 
         # Free ALL feature tensors, dataloaders, and datasets NOW.
-        # Subprocesses create their own data pipelines from indices.
-        # Keeping these alive while a subprocess loads ViT-B/16 + its own
-        # features causes OOM kills on memory-constrained containers.
+        # The in-process imagenet/fine-tuning evals create their own data
+        # pipelines from the resolved indices, so these are no longer needed.
+        # Freeing early reduces peak RSS during the subsequent GPU-heavy steps.
         try:
             del train_feats, test_feats, train_labels, test_labels
             del _train_labels_1d, _test_labels_1d
@@ -1504,18 +1514,17 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # ImageNet Pretrained Baseline — run in subprocess
-        # to isolate CUDA segfaults (signal 11) that kill the process.
+        # ImageNet Pretrained Baseline — run directly in this process.
+        # Previously this used a subprocess to isolate crashes, but spawning
+        # a second Python interpreter doubles the RSS and triggers the OOM
+        # killer on memory-constrained containers.  In-process execution
+        # keeps a single interpreter; we move LeJEPA to CPU to free GPU
+        # memory before loading ResNet50, then restore it afterwards.
         _backbone = getattr(args, 'imagenet_backbone', 'resnet50')
         inet_results = {"accuracy": None, "auc": None}
 
-        # ── Completely unload LeJEPA before subprocess evaluations ──
-        # Moving to CPU is NOT enough: the model still occupies ~760 MB
-        # of host RSS.  The subprocess then allocates its own model +
-        # features, and combined RSS exceeds the container cgroup limit,
-        # triggering the OOM killer.  Delete the model entirely and
-        # reload it from the checkpoint file after subprocesses finish.
-        del lejepa
+        # ── Move LeJEPA to CPU to free GPU memory for subsequent evals ──
+        lejepa.cpu()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1523,7 +1532,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         if getattr(args, 'skip_imagenet', False):
             print(f"\n[{name}] ImageNet Baseline ... SKIPPED (--skip_imagenet)")
         else:
-            print(f"\n[{name}] ImageNet {_backbone} Baseline ... (subprocess)")
+            print(f"\n[{name}] ImageNet {_backbone} Baseline ... (in-process)")
 
             inet_cfg = {
                 "name": name, "dataset_cfg": cfg,
@@ -1535,16 +1544,13 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 "multi_label": _multi_label,
                 "backbone": _backbone,
             }
-            gc.collect()
-            inet_sub = _run_eval_subprocess("imagenet_baseline", inet_cfg, timeout=1800)
-            if inet_sub and "error" not in inet_sub:
-                inet_results = inet_sub
+            try:
+                inet_results = run_imagenet_baseline(inet_cfg)
                 print(f"  MedJEPA LP Accuracy:        {lp_results['accuracy']:.4f}")
                 inet_imp = lp_results['accuracy'] - inet_results['accuracy']
                 print(f"  MedJEPA vs ImageNet:        {inet_imp:+.4f}")
-            else:
-                err_msg = inet_sub.get("error", "unknown") if inet_sub else "crashed"
-                print(f"  ImageNet baseline failed: {err_msg}")
+            except Exception as _ie:
+                print(f"  ImageNet baseline failed: {_ie}")
 
         # ── Save partial results NOW (before fine-tuning subprocess) ──
         # Linear probe / few-shot / n-shot / baselines are already complete.
@@ -1577,12 +1583,12 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             json.dump(all_results, _pf, indent=2, default=str)
         print(f"  [Saved partial results (pre-fine-tuning) to {_partial_path}]")
 
-        # Full Fine-Tuning — run in subprocess to isolate OOM/crashes
+        # Full Fine-Tuning — run directly in this process (no subprocess).
         ft_results = {"accuracy": None, "auc": None}
         if getattr(args, 'skip_finetune', False):
             print(f"\n[{name}] Full Fine-Tuning ... SKIPPED (--skip_finetune)")
         else:
-            print(f"\n[{name}] Full Fine-Tuning ... (subprocess)")
+            print(f"\n[{name}] Full Fine-Tuning ... (in-process)")
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1599,35 +1605,17 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 "checkpoint_path": str(lejepa_ckpt),
                 "multi_label": _multi_label,
             }
-            ft_sub = _run_eval_subprocess("fine_tuning", ft_cfg, timeout=3600)
-            if ft_sub and "error" not in ft_sub:
-                ft_results = ft_sub
-            else:
-                err_msg = ft_sub.get("error", "unknown") if ft_sub else "crashed"
-                print(f"  Fine-tuning failed: {err_msg}")
+            try:
+                ft_results = run_fine_tuning(ft_cfg)
+            except Exception as _fe:
+                print(f"  Fine-tuning failed: {_fe}")
 
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # ── Reload LeJEPA from checkpoint for the next dataset ──
-        lejepa = LeJEPA(
-            image_size=image_size,
-            patch_size=patch_size,
-            embed_dim=embed_dim,
-            encoder_depth=encoder_depth,
-            predictor_depth=predictor_depth,
-            use_ema=True,
-        )
-        _ckpt_reload = torch.load(lejepa_ckpt, map_location="cpu", weights_only=False)
-        _state_reload = {k: v for k, v in _ckpt_reload["model_state_dict"].items()
-                         if "_sketch_matrix" not in k}
-        lejepa.load_state_dict(_state_reload, strict=False)
-        if "ema_encoder_state_dict" in _ckpt_reload:
-            lejepa.ema_encoder.load_state_dict(_ckpt_reload["ema_encoder_state_dict"])
-        del _ckpt_reload, _state_reload
-        gc.collect()
-        lejepa = lejepa.to(device)
+        # ── Restore LeJEPA to GPU for the next dataset ──
+        lejepa.to(device)
         lejepa.eval()
 
         # Update fine-tuning result and save final partial results
