@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -500,22 +501,37 @@ def _run_eval_subprocess(task: str, config_data: dict, timeout: int = 1800) -> d
             **_extra,
         )
 
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Kill the entire process tree so all pipe handles are released,
-            # then drain the (now-closed) pipes immediately.
+        # Stream stdout/stderr in real-time using background threads so the
+        # user sees progress immediately.  A watchdog thread enforces the
+        # overall wall-clock timeout and kills the process tree if exceeded.
+        stderr_lines = []
+        stdout_done = threading.Event()
+
+        def _drain_stdout():
+            for _line in proc.stdout:
+                print(_line, end="", flush=True)
+            stdout_done.set()
+
+        def _drain_stderr():
+            for _line in proc.stderr:
+                stderr_lines.append(_line)
+
+        t_out = threading.Thread(target=_drain_stdout, daemon=True)
+        t_err = threading.Thread(target=_drain_stderr, daemon=True)
+        t_out.start()
+        t_err.start()
+
+        # Wait for the process to finish (with timeout)
+        finished_in_time = stdout_done.wait(timeout=timeout)
+
+        if not finished_in_time or proc.poll() is None:
             _kill_process_tree(proc.pid)
-            try:
-                proc.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
             return {"error": "subprocess timed out"}
 
-        # Print subprocess stdout (it contains progress messages)
-        if stdout:
-            for line in stdout.strip().split("\n"):
-                print(line)
+        proc.wait(timeout=10)   # reap zombie, instant after stdout EOF
+        t_err.join(timeout=5)
 
         if proc.returncode == 0 and os.path.exists(result_path):
             with open(result_path) as f:
@@ -523,7 +539,7 @@ def _run_eval_subprocess(task: str, config_data: dict, timeout: int = 1800) -> d
                 if content:
                     return json.loads(content)
         # Non-zero exit
-        stderr_tail = (stderr or "")[-500:]
+        stderr_tail = "".join(stderr_lines)[-500:]
         return {"error": f"subprocess exited with code {proc.returncode}",
                 "stderr": stderr_tail}
 
@@ -1258,6 +1274,9 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         if test_size < 1:
             test_size = 1
             train_size = len(ds) - 1
+        if train_size < 2:
+            print(f"  [SKIP] {name}: too few samples ({len(ds)})")
+            continue
         train_ds, test_ds = random_split(ds, [train_size, test_size])
 
         train_loader = DataLoader(
@@ -1554,6 +1573,9 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         if test_size < 1:
             test_size = 1
             train_size = len(ds) - 1
+        if train_size < 2:
+            print(f"  [SKIP] {name}: too few samples ({len(ds)})")
+            continue
         train_ds, test_ds = random_split(ds, [train_size, test_size])
 
         train_loader = DataLoader(

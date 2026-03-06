@@ -177,13 +177,11 @@ class FineTuneEvaluator:
             if val_loader is not None:
                 val_acc = self._evaluate_loader(val_loader)
                 history["val_acc"].append(val_acc)
-                if (epoch + 1) % 5 == 0 or epoch == 0:
-                    print(f"  FT Epoch {epoch+1}/{self.num_epochs} | "
-                          f"Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
+                print(f"  FT Epoch {epoch+1}/{self.num_epochs} | "
+                      f"Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}", flush=True)
             else:
-                if (epoch + 1) % 5 == 0 or epoch == 0:
-                    print(f"  FT Epoch {epoch+1}/{self.num_epochs} | "
-                          f"Loss: {avg_loss:.4f}")
+                print(f"  FT Epoch {epoch+1}/{self.num_epochs} | "
+                      f"Loss: {avg_loss:.4f}", flush=True)
 
         # Sync EMA encoder with fine-tuned encoder weights so
         # encode() (used during evaluation) reflects the fine-tuned state
@@ -349,8 +347,12 @@ class ImageNetBaselineEvaluator:
         """Extract features from the ImageNet backbone."""
         all_features, all_labels = [], []
         self.backbone.to(self.device)
+        n_batches = len(dataloader)
         with torch.no_grad():
-            for images, labels in dataloader:
+            for i, (images, labels) in enumerate(dataloader):
+                if (i + 1) % max(1, n_batches // 10) == 0 or i == 0 or (i + 1) == n_batches:
+                    print(f"  Extracting ImageNet features: batch {i+1}/{n_batches}",
+                          flush=True)
                 images = images.to(self.device)
                 features = self.backbone(images)
                 if features.dim() == 3:
@@ -395,9 +397,10 @@ class ImageNetBaselineEvaluator:
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-            if (epoch + 1) % 20 == 0:
+            avg_loss = total_loss / len(loader)
+            if (epoch + 1) % 10 == 0:
                 print(f"  ImageNet Probe Epoch {epoch+1}/{num_epochs} | "
-                      f"Loss: {total_loss / len(loader):.4f}")
+                      f"Loss: {avg_loss:.4f}", flush=True)
 
     def evaluate(
         self,

@@ -62,7 +62,7 @@ class FewShotEvaluator:
             ).cpu().numpy()
 
         # Use kNN classifier
-        knn = KNeighborsClassifier(n_neighbors=min(self.k, len(support_labels)))
+        knn = KNeighborsClassifier(n_neighbors=max(1, min(self.k, len(support_labels))))
         knn.fit(support_features, support_labels.numpy())
 
         predictions = knn.predict(query_features)

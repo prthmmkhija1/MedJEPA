@@ -19,6 +19,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 from typing import Optional
 import numpy as np
+from tqdm import tqdm
 from sklearn.metrics import (
     accuracy_score,
     roc_auc_score,
@@ -76,7 +77,9 @@ class LinearProbeEvaluator:
         all_labels = []
 
         with torch.no_grad():
-            for batch in dataloader:
+            pbar = tqdm(dataloader, desc="  Extracting features", unit="batch",
+                        leave=False, dynamic_ncols=True)
+            for batch in pbar:
                 images, labels = batch
                 images = images.to(self.device)
 
@@ -117,7 +120,9 @@ class LinearProbeEvaluator:
             criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
         self.probe.train()
-        for epoch in range(num_epochs):
+        epoch_bar = tqdm(range(num_epochs), desc="  Linear Probe", unit="epoch",
+                         dynamic_ncols=True)
+        for epoch in epoch_bar:
             total_loss = 0
             for features, labels in loader:
                 features = features.to(self.device)
@@ -138,9 +143,10 @@ class LinearProbeEvaluator:
                 total_loss += loss.item()
 
             scheduler.step()
+            avg_loss = total_loss / len(loader)
+            epoch_bar.set_postfix(loss=f"{avg_loss:.4f}")
 
             if (epoch + 1) % 20 == 0:
-                avg_loss = total_loss / len(loader)
                 print(f"  Probe Epoch {epoch+1}/{num_epochs} | Loss: {avg_loss:.4f}")
 
     def evaluate(
