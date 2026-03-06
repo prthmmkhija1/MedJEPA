@@ -1508,15 +1508,22 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         # to isolate CUDA segfaults (signal 11) that kill the process.
         _backbone = getattr(args, 'imagenet_backbone', 'resnet50')
         inet_results = {"accuracy": None, "auc": None}
+
+        # ── Completely unload LeJEPA before subprocess evaluations ──
+        # Moving to CPU is NOT enough: the model still occupies ~760 MB
+        # of host RSS.  The subprocess then allocates its own model +
+        # features, and combined RSS exceeds the container cgroup limit,
+        # triggering the OOM killer.  Delete the model entirely and
+        # reload it from the checkpoint file after subprocesses finish.
+        del lejepa
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         if getattr(args, 'skip_imagenet', False):
             print(f"\n[{name}] ImageNet Baseline ... SKIPPED (--skip_imagenet)")
         else:
             print(f"\n[{name}] ImageNet {_backbone} Baseline ... (subprocess)")
-            # Move LeJEPA to CPU so subprocess gets the full GPU
-            lejepa.cpu()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
 
             inet_cfg = {
                 "name": name, "dataset_cfg": cfg,
@@ -1528,6 +1535,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 "multi_label": _multi_label,
                 "backbone": _backbone,
             }
+            gc.collect()
             inet_sub = _run_eval_subprocess("imagenet_baseline", inet_cfg, timeout=1800)
             if inet_sub and "error" not in inet_sub:
                 inet_results = inet_sub
@@ -1537,9 +1545,6 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             else:
                 err_msg = inet_sub.get("error", "unknown") if inet_sub else "crashed"
                 print(f"  ImageNet baseline failed: {err_msg}")
-
-            # Do NOT restore LeJEPA to GPU here — fine-tuning subprocess is next
-            # and will immediately call lejepa.cpu() again anyway.
 
         # ── Save partial results NOW (before fine-tuning subprocess) ──
         # Linear probe / few-shot / n-shot / baselines are already complete.
@@ -1578,10 +1583,9 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             print(f"\n[{name}] Full Fine-Tuning ... SKIPPED (--skip_finetune)")
         else:
             print(f"\n[{name}] Full Fine-Tuning ... (subprocess)")
-            lejepa.cpu()
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            gc.collect()
 
             ft_cfg = {
                 "name": name, "dataset_cfg": cfg,
@@ -1602,11 +1606,29 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 err_msg = ft_sub.get("error", "unknown") if ft_sub else "crashed"
                 print(f"  Fine-tuning failed: {err_msg}")
 
-            # Do NOT restore LeJEPA to GPU here.
-            # It will be moved to GPU lazily at the start of the next dataset.
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        # ── Reload LeJEPA from checkpoint for the next dataset ──
+        lejepa = LeJEPA(
+            image_size=image_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            encoder_depth=encoder_depth,
+            predictor_depth=predictor_depth,
+            use_ema=True,
+        )
+        _ckpt_reload = torch.load(lejepa_ckpt, map_location="cpu", weights_only=False)
+        _state_reload = {k: v for k, v in _ckpt_reload["model_state_dict"].items()
+                         if "_sketch_matrix" not in k}
+        lejepa.load_state_dict(_state_reload, strict=False)
+        if "ema_encoder_state_dict" in _ckpt_reload:
+            lejepa.ema_encoder.load_state_dict(_ckpt_reload["ema_encoder_state_dict"])
+        del _ckpt_reload, _state_reload
+        gc.collect()
+        lejepa = lejepa.to(device)
+        lejepa.eval()
 
         # Update fine-tuning result and save final partial results
         all_results[name]["fine_tuning"] = {

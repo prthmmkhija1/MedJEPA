@@ -54,12 +54,12 @@ def run_imagenet_baseline(cfg):
     train_loader = DataLoader(
         train_ds, batch_size=batch_size,
         num_workers=0,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=False,
     )
     test_loader = DataLoader(
         test_ds, batch_size=batch_size,
         num_workers=0,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=False,
     )
 
     inet_eval = ImageNetBaselineEvaluator(
@@ -145,15 +145,17 @@ def run_fine_tuning(cfg):
     test_ds = Subset(ds, test_indices)
 
     # num_workers=0: see note in run_imagenet_baseline above.
+    # pin_memory=False: pinned (page-locked) pages count against the
+    # container cgroup memory limit and cannot be swapped.
     train_loader = DataLoader(
         train_ds, batch_size=batch_size,
         num_workers=0,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=False,
     )
     test_loader = DataLoader(
         test_ds, batch_size=batch_size,
         num_workers=0,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=False,
     )
 
     # Load checkpoint to CPU first — loading directly to CUDA would place
@@ -161,16 +163,17 @@ def run_fine_tuning(cfg):
     # memory before we even build the model.
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
+    # Build model WITHOUT EMA — saves ~380 MB GPU / ~380 MB CPU.
+    # Fine-tuning only uses the online encoder (encode_with_grad).
+    # We sync the trained weights into EMA at the very end before evaluate().
     ft_model = LeJEPA(
         image_size=image_size, patch_size=patch_size,
         embed_dim=embed_dim, encoder_depth=encoder_depth,
-        predictor_depth=predictor_depth, use_ema=True,
+        predictor_depth=predictor_depth, use_ema=False,
     )
     ft_state = {k: v for k, v in ckpt["model_state_dict"].items()
-                if "_sketch_matrix" not in k}
+                if "_sketch_matrix" not in k and "ema_encoder" not in k}
     ft_model.load_state_dict(ft_state, strict=False)
-    if "ema_encoder_state_dict" in ckpt:
-        ft_model.ema_encoder.load_state_dict(ckpt["ema_encoder_state_dict"])
     # Free the raw checkpoint dict — it holds optimizer states and a second copy
     # of all weight tensors (~1.5-2 GB CPU RAM) that are no longer needed.
     del ckpt, ft_state
@@ -185,29 +188,15 @@ def run_fine_tuning(cfg):
         multi_label=multi_label,
     )
 
-    # Offload EMA encoder and predictor to CPU during training — they are
-    # NOT used in the train loop (encode_with_grad uses self.encoder, not
-    # EMA) but consume ~400 MB GPU + host pinned memory.  Restoring EMA
-    # before evaluate() is enough.
-    _ema_offloaded = False
-    if hasattr(ft_eval.model, 'ema_encoder') and ft_eval.model.ema_encoder is not None:
-        ft_eval.model.ema_encoder.cpu()
-        _ema_offloaded = True
+    # Predictor is not used during fine-tuning; delete to save memory.
     if hasattr(ft_eval.model, 'predictor') and ft_eval.model.predictor is not None:
-        ft_eval.model.predictor.cpu()
+        del ft_eval.model.predictor
+        ft_eval.model.predictor = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     ft_history = ft_eval.train(train_loader, test_loader)
-
-    # Restore EMA to GPU for evaluation (encode() uses EMA encoder)
-    if _ema_offloaded and ft_eval.model.ema_encoder is not None:
-        ft_eval.model.ema_encoder.to(device)
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     ft_results = ft_eval.evaluate(test_loader)
 
     print(f"  Fine-Tune Accuracy: {ft_results['accuracy']:.4f}")
