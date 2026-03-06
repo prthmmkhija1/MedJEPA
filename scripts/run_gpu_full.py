@@ -1286,10 +1286,31 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
     lejepa.eval()
     print("LeJEPA loaded!\n")
 
+    # -- Load any existing partial results (resume support) --
+    _resume_partial_path = Path(args.results_dir) / "evaluation_results_partial.json"
+    if _resume_partial_path.exists():
+        try:
+            with open(_resume_partial_path) as _rf:
+                _existing = json.load(_rf)
+            # Merge into all_results so already-done datasets are preserved
+            for _k, _v in _existing.items():
+                if _k not in all_results:
+                    all_results[_k] = _v
+            print(f"[Resume] Loaded partial results for: {list(_existing.keys())}")
+        except Exception as _e:
+            print(f"[Resume] Could not load partial results: {_e}")
+
     # -- Evaluate 2D datasets --
     for name, cfg in DATASETS_2D.items():
         if not check_dataset_exists(cfg):
             print(f"  SKIP {name}: data not found")
+            continue
+
+        # Resume: skip datasets that already have a complete fine-tuning result
+        _prior = all_results.get(name, {})
+        _prior_ft_acc = _prior.get("fine_tuning", {}).get("accuracy") if _prior else None
+        if _prior_ft_acc is not None:
+            print(f"  SKIP {name}: already evaluated (FT acc={_prior_ft_acc:.4f}), loaded from partial results")
             continue
 
         banner(f"Evaluating: {name.upper()} -- {cfg['description']}")
