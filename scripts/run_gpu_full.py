@@ -1410,6 +1410,24 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         _train_indices = _resolve_subset_indices(train_ds)
         _test_indices = _resolve_subset_indices(test_ds)
 
+        # Free ALL feature tensors, dataloaders, and datasets NOW.
+        # Subprocesses create their own data pipelines from indices.
+        # Keeping these alive while a subprocess loads ViT-B/16 + its own
+        # features causes OOM kills on memory-constrained containers.
+        try:
+            del train_feats, test_feats, train_labels, test_labels
+            del _train_labels_1d, _test_labels_1d
+        except NameError:
+            pass
+        try:
+            del _nshot_test_feats, _nshot_test_labels_1d
+        except NameError:
+            pass
+        del train_loader, test_loader, train_ds, test_ds
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # ImageNet Pretrained Baseline (ViT-B/16) — run in subprocess
         # to isolate CUDA segfaults (signal 11) that kill the process.
         inet_results = {"accuracy": None, "auc": None}
@@ -1485,18 +1503,6 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             print(f"\n[{name}] Full Fine-Tuning ... SKIPPED (--skip_finetune)")
         else:
             print(f"\n[{name}] Full Fine-Tuning ... (subprocess)")
-            # Free extracted features before fine-tuning to reclaim memory
-            try:
-                del train_feats, test_feats, train_labels, test_labels
-                del _train_labels_1d, _test_labels_1d
-            except NameError:
-                pass
-            try:
-                del _nshot_test_feats, _nshot_test_labels_1d
-            except NameError:
-                pass
-            gc.collect()
-
             lejepa.cpu()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1666,7 +1672,11 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         bl_results = baseline_lp.evaluate(bl_test_feats, bl_test_labels)
         print(f"  Baseline Accuracy: {bl_results['accuracy']:.4f}")
         print(f"  MedJEPA  Accuracy: {lp_results['accuracy']:.4f}")
-        del baseline_model
+        del baseline_model, baseline_lp
+        del bl_train_feats, bl_test_feats, bl_train_labels, bl_test_labels
+        del train_feats, test_feats, train_labels, test_labels
+        del train_loader, test_loader, train_ds, test_ds
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

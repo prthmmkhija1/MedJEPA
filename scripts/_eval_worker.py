@@ -75,6 +75,16 @@ def run_imagenet_baseline(cfg):
 
     # Strip non-serializable report
     inet_results.pop("report", None)
+
+    # Explicit cleanup — free all large tensors before the subprocess exits
+    # to avoid peak-memory overlap with the parent process.
+    del inet_eval, inet_train_feats, inet_train_labs
+    del inet_test_feats, inet_test_labs
+    del train_loader, test_loader, train_ds, test_ds, ds
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return inet_results
 
 
@@ -148,6 +158,13 @@ def run_fine_tuning(cfg):
         print(f"  Fine-Tune AUC:      {ft_results['auc']:.4f}")
 
     ft_results.pop("report", None)
+
+    # Explicit cleanup before exit
+    del ft_eval, ft_model, train_loader, test_loader, train_ds, test_ds, ds
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return ft_results
 
 
