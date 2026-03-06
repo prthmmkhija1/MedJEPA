@@ -350,7 +350,10 @@ def parse_args():
     p.add_argument("--no_prefetcher", action="store_true",
                    help="Disable CUDA stream prefetcher")
     p.add_argument("--skip_imagenet", action="store_true",
-                   help="Skip ImageNet ViT-B/16 baseline (avoids OOM/segfault on low-VRAM GPUs)")
+                   help="Skip ImageNet baseline (avoids OOM/segfault on low-VRAM GPUs)")
+    p.add_argument("--imagenet_backbone", default="resnet50",
+                   choices=["resnet50", "vit_b_16"],
+                   help="Backbone for ImageNet baseline (resnet50 uses ~4x less memory)")
     p.add_argument("--skip_finetune", action="store_true",
                    help="Skip full fine-tuning evaluation (saves time; linear probe results still run)")
 
@@ -445,6 +448,30 @@ def _kill_process_tree(pid: int):
                 pass
 
 
+def _parse_results_from_stdout(lines: list) -> dict:
+    """Parse accuracy/AUC from subprocess stdout as an OOM-kill fallback.
+
+    The subprocess prints results before cleanup, so if it's OOM-killed
+    during gc.collect() / cuda.empty_cache(), we can still recover them.
+    """
+    import re
+    results = {"accuracy": None, "auc": None}
+    for line in lines:
+        m = re.search(r'Baseline Accuracy:\s*([\d.]+)', line)
+        if m:
+            results["accuracy"] = float(m.group(1))
+        m = re.search(r'Baseline AUC:\s*([\d.]+)', line)
+        if m:
+            results["auc"] = float(m.group(1))
+        m = re.search(r'Fine-Tune Accuracy:\s*([\d.]+)', line)
+        if m:
+            results["accuracy"] = float(m.group(1))
+        m = re.search(r'Fine-Tune AUC:\s*([\d.]+)', line)
+        if m:
+            results["auc"] = float(m.group(1))
+    return results
+
+
 def _run_eval_subprocess(task: str, config_data: dict, timeout: int = 1800) -> dict:
     """
     Run an evaluation task in an isolated subprocess.
@@ -505,11 +532,13 @@ def _run_eval_subprocess(task: str, config_data: dict, timeout: int = 1800) -> d
         # user sees progress immediately.  A watchdog thread enforces the
         # overall wall-clock timeout and kills the process tree if exceeded.
         stderr_lines = []
+        stdout_lines = []
         stdout_done = threading.Event()
 
         def _drain_stdout():
             for _line in proc.stdout:
                 print(_line, end="", flush=True)
+                stdout_lines.append(_line)
             stdout_done.set()
 
         def _drain_stderr():
@@ -533,12 +562,26 @@ def _run_eval_subprocess(task: str, config_data: dict, timeout: int = 1800) -> d
         proc.wait(timeout=10)   # reap zombie, instant after stdout EOF
         t_err.join(timeout=5)
 
-        if proc.returncode == 0 and os.path.exists(result_path):
-            with open(result_path) as f:
-                content = f.read().strip()
-                if content:
-                    return json.loads(content)
-        # Non-zero exit
+        # Try reading the result file (written early by the worker,
+        # so it may exist even if the process was OOM-killed during cleanup).
+        if os.path.exists(result_path):
+            try:
+                with open(result_path) as f:
+                    content = f.read().strip()
+                    if content:
+                        return json.loads(content)
+            except Exception:
+                pass
+
+        # Fallback: parse accuracy/AUC from stdout lines.
+        # The worker prints them before cleanup, so they survive OOM kills.
+        if proc.returncode != 0:
+            parsed = _parse_results_from_stdout(stdout_lines)
+            if parsed.get("accuracy") is not None:
+                return parsed
+
+        if proc.returncode == 0:
+            return {"error": "subprocess exited 0 but no result file found"}
         stderr_tail = "".join(stderr_lines)[-500:]
         return {"error": f"subprocess exited with code {proc.returncode}",
                 "stderr": stderr_tail}
@@ -1428,13 +1471,14 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # ImageNet Pretrained Baseline (ViT-B/16) — run in subprocess
+        # ImageNet Pretrained Baseline — run in subprocess
         # to isolate CUDA segfaults (signal 11) that kill the process.
+        _backbone = getattr(args, 'imagenet_backbone', 'resnet50')
         inet_results = {"accuracy": None, "auc": None}
         if getattr(args, 'skip_imagenet', False):
-            print(f"\n[{name}] ImageNet ViT-B/16 Baseline ... SKIPPED (--skip_imagenet)")
+            print(f"\n[{name}] ImageNet Baseline ... SKIPPED (--skip_imagenet)")
         else:
-            print(f"\n[{name}] ImageNet ViT-B/16 Baseline ... (subprocess)")
+            print(f"\n[{name}] ImageNet {_backbone} Baseline ... (subprocess)")
             # Move LeJEPA to CPU so subprocess gets the full GPU
             lejepa.cpu()
             if torch.cuda.is_available():
@@ -1449,6 +1493,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 "train_indices": _train_indices,
                 "test_indices": _test_indices,
                 "multi_label": _multi_label,
+                "backbone": _backbone,
             }
             inet_sub = _run_eval_subprocess("imagenet_baseline", inet_cfg, timeout=1800)
             if inet_sub and "error" not in inet_sub:

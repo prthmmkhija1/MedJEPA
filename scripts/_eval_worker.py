@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader, Subset
 
 
 def run_imagenet_baseline(cfg):
-    """Run ImageNet ViT-B/16 baseline evaluation."""
+    """Run ImageNet baseline evaluation."""
     from medjepa.evaluation.fine_tune import ImageNetBaselineEvaluator
 
     num_classes = cfg["num_classes"]
@@ -37,8 +37,10 @@ def run_imagenet_baseline(cfg):
     image_size = cfg["image_size"]
     max_samples = cfg.get("max_samples")
     multi_label = cfg.get("multi_label", False)
+    backbone = cfg.get("backbone", "resnet50")
     ds_name = cfg["name"]
     ds_cfg = cfg["dataset_cfg"]
+    result_path = cfg.get("_result_path")  # early-write path
 
     # Recreate dataset
     ds = _load_dataset(ds_name, ds_cfg, image_size, max_samples)
@@ -61,7 +63,7 @@ def run_imagenet_baseline(cfg):
     )
 
     inet_eval = ImageNetBaselineEvaluator(
-        num_classes=num_classes, backbone="vit_b_16",
+        num_classes=num_classes, backbone=backbone,
         multi_label=multi_label,
     )
     inet_train_feats, inet_train_labs = inet_eval.extract_features(train_loader)
@@ -93,6 +95,16 @@ def run_imagenet_baseline(cfg):
 
     # Strip non-serializable report
     inet_results.pop("report", None)
+
+    # Write result JSON IMMEDIATELY — before cleanup.
+    # The OOM killer may strike during gc.collect() / cuda.empty_cache(),
+    # so we persist results while they're still available.
+    if result_path:
+        try:
+            with open(result_path, "w") as _rf:
+                json.dump(inet_results, _rf)
+        except Exception:
+            pass
 
     # Final cleanup
     del inet_eval, inet_test_feats, inet_test_labs
@@ -226,6 +238,7 @@ def main():
         cfg = json.load(f)
 
     if args.task == "imagenet_baseline":
+        cfg["_result_path"] = args.result  # allow early-write
         results = run_imagenet_baseline(cfg)
     elif args.task == "fine_tuning":
         results = run_fine_tuning(cfg)
