@@ -36,6 +36,7 @@ def run_imagenet_baseline(cfg):
     test_indices = cfg["test_indices"]
     image_size = cfg["image_size"]
     max_samples = cfg.get("max_samples")
+    multi_label = cfg.get("multi_label", False)
     ds_name = cfg["name"]
     ds_cfg = cfg["dataset_cfg"]
 
@@ -44,19 +45,24 @@ def run_imagenet_baseline(cfg):
     train_ds = Subset(ds, train_indices)
     test_ds = Subset(ds, test_indices)
 
+    # num_workers=0: subprocess workers inherit stdout/stderr pipe handles on
+    # Windows; if the subprocess is killed (e.g. on timeout), those handles
+    # stay open and the parent communicate() deadlocks.  Single-process
+    # loading avoids spawning any children inside this subprocess.
     train_loader = DataLoader(
         train_ds, batch_size=batch_size,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
     test_loader = DataLoader(
         test_ds, batch_size=batch_size,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
 
     inet_eval = ImageNetBaselineEvaluator(
         num_classes=num_classes, backbone="vit_b_16",
+        multi_label=multi_label,
     )
     inet_train_feats, inet_train_labs = inet_eval.extract_features(train_loader)
     inet_test_feats, inet_test_labs = inet_eval.extract_features(test_loader)
@@ -89,6 +95,7 @@ def run_fine_tuning(cfg):
     predictor_depth = cfg["predictor_depth"]
     checkpoint_path = cfg["checkpoint_path"]
     max_samples = cfg.get("max_samples")
+    multi_label = cfg.get("multi_label", False)
     ds_name = cfg["name"]
     ds_cfg = cfg["dataset_cfg"]
 
@@ -99,14 +106,15 @@ def run_fine_tuning(cfg):
     train_ds = Subset(ds, train_indices)
     test_ds = Subset(ds, test_indices)
 
+    # num_workers=0: see note in run_imagenet_baseline above.
     train_loader = DataLoader(
         train_ds, batch_size=batch_size,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
     test_loader = DataLoader(
         test_ds, batch_size=batch_size,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -130,6 +138,7 @@ def run_fine_tuning(cfg):
         num_classes=num_classes,
         embed_dim=embed_dim,
         num_epochs=20,
+        multi_label=multi_label,
     )
     ft_history = ft_eval.train(train_loader, test_loader)
     ft_results = ft_eval.evaluate(test_loader)

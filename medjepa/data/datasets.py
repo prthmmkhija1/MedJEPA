@@ -281,8 +281,8 @@ class ChestXray14Dataset(Dataset):
             image = self.transform(image)
 
         if self.labels is not None:
-            # Return single-label int for linear probe compatibility
-            return image, int(self.single_labels[idx])
+            # Return multi-hot label vector [14] for multi-label evaluation
+            return image, torch.tensor(self.labels[idx], dtype=torch.float32)
         return image
 
 

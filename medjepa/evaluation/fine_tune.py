@@ -20,7 +20,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from typing import Optional
 import numpy as np
-from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
+from sklearn.metrics import accuracy_score, roc_auc_score, classification_report, average_precision_score
 from medjepa.utils.device import get_device
 
 
@@ -50,6 +50,7 @@ class FineTuneEvaluator:
         batch_size: int = 16,
         weight_decay: float = 0.01,
         grad_accum_steps: int = 4,
+        multi_label: bool = False,
     ):
         self.device = get_device()
         self.model = pretrained_model.to(self.device)
@@ -61,6 +62,7 @@ class FineTuneEvaluator:
         self.batch_size = batch_size
         self.weight_decay = weight_decay
         self.grad_accum_steps = grad_accum_steps
+        self.multi_label = multi_label
 
         # Classification head
         self.head = nn.Sequential(
@@ -127,7 +129,10 @@ class FineTuneEvaluator:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.num_epochs,
         )
-        criterion = nn.CrossEntropyLoss()
+        if self.multi_label:
+            criterion = nn.BCEWithLogitsLoss()
+        else:
+            criterion = nn.CrossEntropyLoss()
 
         history = {"train_loss": [], "val_acc": []}
 
@@ -148,7 +153,10 @@ class FineTuneEvaluator:
                 else:
                     features = self.model.encode(images)
                 logits = self.head(features)
-                loss = criterion(logits, labels) / self.grad_accum_steps
+                if self.multi_label:
+                    loss = criterion(logits, labels.float()) / self.grad_accum_steps
+                else:
+                    loss = criterion(logits, labels) / self.grad_accum_steps
                 loss.backward()
 
                 if (step + 1) % self.grad_accum_steps == 0 or (step + 1) == len(train_loader):
@@ -202,11 +210,17 @@ class FineTuneEvaluator:
                 images = images.to(self.device)
                 features = self.model.encode(images)
                 logits = self.head(features)
-                preds = logits.argmax(dim=1).cpu()
+                if self.multi_label:
+                    preds = (torch.sigmoid(logits) >= 0.5).int().cpu()
+                else:
+                    preds = logits.argmax(dim=1).cpu()
                 all_preds.append(preds)
                 all_labels.append(labels)
         preds = torch.cat(all_preds).numpy()
         labels = torch.cat(all_labels).numpy()
+        if self.multi_label:
+            # Subset accuracy for multi-label
+            return float((preds == labels.astype(int)).all(axis=1).mean())
         return float(accuracy_score(labels, preds))
 
     def evaluate(
@@ -226,14 +240,35 @@ class FineTuneEvaluator:
                 images = images.to(self.device)
                 features = self.model.encode(images)
                 logits = self.head(features)
-                probs = torch.softmax(logits, dim=1)
-                all_preds.append(logits.argmax(dim=1).cpu())
+                if self.multi_label:
+                    probs = torch.sigmoid(logits)
+                    all_preds.append((probs >= 0.5).int().cpu())
+                else:
+                    probs = torch.softmax(logits, dim=1)
+                    all_preds.append(logits.argmax(dim=1).cpu())
                 all_probs.append(probs.cpu())
                 all_labels.append(labels)
 
         preds = torch.cat(all_preds).numpy()
         probs = torch.cat(all_probs).numpy()
         labels = torch.cat(all_labels).numpy()
+
+        if self.multi_label:
+            labels_int = labels.astype(int)
+            results = {
+                "accuracy": float((preds == labels_int).all(axis=1).mean()),
+            }
+            try:
+                from sklearn.metrics import roc_auc_score, average_precision_score
+                results["auc"] = float(roc_auc_score(
+                    labels_int, probs, average="macro",
+                ))
+                results["map"] = float(average_precision_score(
+                    labels_int, probs, average="macro",
+                ))
+            except Exception:
+                results["auc"] = None
+            return results
 
         results = {
             "accuracy": float(accuracy_score(labels, preds)),
@@ -270,11 +305,12 @@ class ImageNetBaselineEvaluator:
         self,
         num_classes: int,
         backbone: str = "vit_b_16",
-        # One of: "vit_b_16", "resnet50"
+        multi_label: bool = False,
     ):
         self.device = get_device()
         self.num_classes = num_classes
         self.backbone_name = backbone
+        self.multi_label = multi_label
         self.backbone, self.embed_dim = self._build_backbone(backbone)
         self.backbone = self.backbone.to(self.device)
         self.backbone.eval()
@@ -340,7 +376,10 @@ class ImageNetBaselineEvaluator:
         dataset = TensorDataset(train_features, train_labels)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         optimizer = torch.optim.SGD(self.probe.parameters(), lr=lr, momentum=0.9)
-        criterion = nn.CrossEntropyLoss()
+        if self.multi_label:
+            criterion = nn.BCEWithLogitsLoss()
+        else:
+            criterion = nn.CrossEntropyLoss()
 
         self.probe.train()
         for epoch in range(num_epochs):
@@ -348,7 +387,10 @@ class ImageNetBaselineEvaluator:
             for feats, labels in loader:
                 feats, labels = feats.to(self.device), labels.to(self.device)
                 logits = self.probe(feats)
-                loss = criterion(logits, labels)
+                if self.multi_label:
+                    loss = criterion(logits, labels.float())
+                else:
+                    loss = criterion(logits, labels)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -367,10 +409,31 @@ class ImageNetBaselineEvaluator:
         with torch.no_grad():
             test_features = test_features.to(self.device)
             logits = self.probe(test_features)
-            preds = logits.argmax(dim=1).cpu().numpy()
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
+
+            if self.multi_label:
+                probs = torch.sigmoid(logits).cpu().numpy()
+                preds = (probs >= 0.5).astype(int)
+            else:
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                preds = logits.argmax(dim=1).cpu().numpy()
 
         labels = test_labels.numpy()
+
+        if self.multi_label:
+            labels_int = labels.astype(int)
+            results = {
+                "accuracy": float((preds == labels_int).all(axis=1).mean()),
+            }
+            try:
+                results["auc"] = float(roc_auc_score(
+                    labels_int, probs, average="macro",
+                ))
+                results["map"] = float(average_precision_score(
+                    labels_int, probs, average="macro",
+                ))
+            except Exception:
+                results["auc"] = None
+            return results
 
         results = {
             "accuracy": float(accuracy_score(labels, preds)),

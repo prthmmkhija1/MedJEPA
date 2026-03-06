@@ -350,6 +350,8 @@ def parse_args():
                    help="Disable CUDA stream prefetcher")
     p.add_argument("--skip_imagenet", action="store_true",
                    help="Skip ImageNet ViT-B/16 baseline (avoids OOM/segfault on low-VRAM GPUs)")
+    p.add_argument("--skip_finetune", action="store_true",
+                   help="Skip full fine-tuning evaluation (saves time; linear probe results still run)")
 
     raw = p.parse_args()
 
@@ -415,6 +417,33 @@ import subprocess
 import tempfile
 
 
+def _kill_process_tree(pid: int):
+    """
+    Kill a process AND all its descendant processes.
+
+    On Windows, subprocess DataLoader workers inherit the stdout/stderr pipe
+    file handles.  When the parent subprocess is killed but workers survive,
+    those workers keep the pipe open, and any subsequent communicate() call
+    in the parent blocks forever.  Killing the entire tree closes all handles.
+    """
+    if os.name == 'nt':
+        # /F force, /T tree (children), /PID target
+        subprocess.call(
+            ['taskkill', '/F', '/T', '/PID', str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        import signal as _sig
+        try:
+            os.killpg(os.getpgid(pid), _sig.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid, _sig.SIGKILL)
+            except Exception:
+                pass
+
+
 def _run_eval_subprocess(task: str, config_data: dict, timeout: int = 1800) -> dict:
     """
     Run an evaluation task in an isolated subprocess.
@@ -422,6 +451,18 @@ def _run_eval_subprocess(task: str, config_data: dict, timeout: int = 1800) -> d
     This prevents CUDA segfaults (signal 11) from killing the main pipeline.
     The subprocess gets its own fresh CUDA context; if it crashes, only the
     child dies and the parent continues with the next evaluation.
+
+    Windows pipe-deadlock fix
+    ─────────────────────────
+    subprocess.run(capture_output=True) creates stdout/stderr pipes.  On
+    Windows, any DataLoader workers spawned inside the child process inherit
+    those pipe handles.  When the child is killed (e.g. on timeout), the
+    workers keep the handles open, so communicate() blocks forever waiting
+    for EOF.  We fix this by:
+      1. Using Popen with CREATE_NEW_PROCESS_GROUP so the whole tree can be
+         signalled at once.
+      2. Calling _kill_process_tree() on timeout (taskkill /F /T on Windows)
+         which kills all worker children too, releasing all pipe handles.
 
     Args:
         task: "imagenet_baseline" or "fine_tuning"
@@ -441,19 +482,39 @@ def _run_eval_subprocess(task: str, config_data: dict, timeout: int = 1800) -> d
             json.dump(config_data, f)
 
         worker_script = str(PROJECT_ROOT / "scripts" / "_eval_worker.py")
-        proc = subprocess.run(
-            [sys.executable, worker_script,
+
+        # Use CREATE_NEW_PROCESS_GROUP on Windows so we can kill the entire
+        # process tree (including DataLoader workers) on timeout.
+        _extra = {}
+        if os.name == 'nt':
+            _extra['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+        proc = subprocess.Popen(
+            [sys.executable, "-u", worker_script,
              "--task", task,
              "--config", config_path,
              "--result", result_path],
-            timeout=timeout,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
+            **_extra,
         )
 
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill the entire process tree so all pipe handles are released,
+            # then drain the (now-closed) pipes immediately.
+            _kill_process_tree(proc.pid)
+            try:
+                proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            return {"error": "subprocess timed out"}
+
         # Print subprocess stdout (it contains progress messages)
-        if proc.stdout:
-            for line in proc.stdout.strip().split("\n"):
+        if stdout:
+            for line in stdout.strip().split("\n"):
                 print(line)
 
         if proc.returncode == 0 and os.path.exists(result_path):
@@ -462,12 +523,10 @@ def _run_eval_subprocess(task: str, config_data: dict, timeout: int = 1800) -> d
                 if content:
                     return json.loads(content)
         # Non-zero exit
-        stderr_tail = (proc.stderr or "")[-500:]
+        stderr_tail = (stderr or "")[-500:]
         return {"error": f"subprocess exited with code {proc.returncode}",
                 "stderr": stderr_tail}
 
-    except subprocess.TimeoutExpired:
-        return {"error": "subprocess timed out"}
     except Exception as e:
         return {"error": str(e)}
     finally:
@@ -1234,32 +1293,41 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         if lp_results.get("auc"):
             print(f"  Linear Probe AUC:      {lp_results['auc']:.4f}")
 
+        # For multi-label datasets (ChestXray14), KNN-based evaluators
+        # need single integer labels.  Convert multi-hot → argmax.
+        if _multi_label and train_labels.dim() == 2:
+            _train_labels_1d = train_labels.argmax(dim=1)
+            _test_labels_1d = test_labels.argmax(dim=1)
+        else:
+            _train_labels_1d = train_labels
+            _test_labels_1d = test_labels
+
         # Few-Shot / Data Efficiency
         print(f"\n[{name}] Few-Shot (Data Efficiency) ...")
         fs = FewShotEvaluator(pretrained_model=lejepa)
         fs_results = fs.evaluate_data_efficiency(
-            train_feats, train_labels,
-            test_feats, test_labels,
+            train_feats, _train_labels_1d,
+            test_feats, _test_labels_1d,
             fractions=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
         )
 
         # N-Shot Evaluation (5-shot, 10-shot, 20-shot per class)
         print(f"\n[{name}] N-Shot Classification (5/10/20-shot) ...")
         n_shot_results = {}
-        unique_classes = torch.unique(train_labels)
+        unique_classes = torch.unique(_train_labels_1d)
         # Subsample test features for kNN if dataset is very large
         _nshot_test_feats = test_feats
-        _nshot_test_labels = test_labels
-        if len(test_labels) > 20000:
+        _nshot_test_labels_1d = _test_labels_1d
+        if len(_test_labels_1d) > 20000:
             _rng = np.random.RandomState(42)
-            _idx = _rng.choice(len(test_labels), 20000, replace=False)
+            _idx = _rng.choice(len(_test_labels_1d), 20000, replace=False)
             _nshot_test_feats = test_feats[_idx]
-            _nshot_test_labels = test_labels[_idx]
+            _nshot_test_labels_1d = _test_labels_1d[_idx]
         for n_shot in [5, 10, 20]:
             # Sample n_shot examples per class from training features
             support_idx = []
             for cls in unique_classes:
-                cls_idx = (train_labels == cls).nonzero(as_tuple=True)[0]
+                cls_idx = (_train_labels_1d == cls).nonzero(as_tuple=True)[0]
                 if len(cls_idx) >= n_shot:
                     perm = cls_idx[torch.randperm(len(cls_idx))[:n_shot]]
                 else:
@@ -1267,7 +1335,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 support_idx.append(perm)
             support_idx = torch.cat(support_idx)
             support_feats = train_feats[support_idx]
-            support_labs = train_labels[support_idx]
+            support_labs = _train_labels_1d[support_idx]
 
             from sklearn.neighbors import KNeighborsClassifier
             from sklearn.metrics import accuracy_score
@@ -1275,7 +1343,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             knn = KNeighborsClassifier(n_neighbors=max(1, k), algorithm='ball_tree')
             knn.fit(support_feats.numpy(), support_labs.numpy())
             preds = knn.predict(_nshot_test_feats.numpy())
-            acc = accuracy_score(_nshot_test_labels.numpy(), preds)
+            acc = accuracy_score(_nshot_test_labels_1d.numpy(), preds)
             n_shot_results[f"{n_shot}-shot"] = {
                 "accuracy": acc,
                 "num_support": len(support_labs),
@@ -1297,6 +1365,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             pretrained_model=baseline_model,
             num_classes=num_classes,
             embed_dim=embed_dim,
+            multi_label=_multi_label,
         )
         baseline_train_feats, baseline_train_labels = baseline_lp.extract_features(train_loader)
         baseline_test_feats, baseline_test_labels = baseline_lp.extract_features(test_loader)
@@ -1342,6 +1411,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 "max_samples": args.max_samples,
                 "train_indices": _train_indices,
                 "test_indices": _test_indices,
+                "multi_label": _multi_label,
             }
             inet_sub = _run_eval_subprocess("imagenet_baseline", inet_cfg, timeout=1800)
             if inet_sub and "error" not in inet_sub:
@@ -1359,49 +1429,10 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             gc.collect()
             lejepa.to(device)
 
-        # Full Fine-Tuning — run in subprocess to isolate OOM/crashes
-        print(f"\n[{name}] Full Fine-Tuning ... (subprocess)")
-        ft_results = {"accuracy": None, "auc": None}
-        # Free extracted features before fine-tuning to reclaim memory
-        try:
-            del train_feats, test_feats, train_labels, test_labels
-        except NameError:
-            pass
-        try:
-            del _nshot_test_feats, _nshot_test_labels
-        except NameError:
-            pass
-        gc.collect()
-
-        lejepa.cpu()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
-        ft_cfg = {
-            "name": name, "dataset_cfg": cfg,
-            "image_size": image_size, "num_classes": num_classes,
-            "batch_size": args.batch_size, "num_workers": args.num_workers,
-            "max_samples": args.max_samples,
-            "train_indices": _train_indices,
-            "test_indices": _test_indices,
-            "patch_size": patch_size, "embed_dim": embed_dim,
-            "encoder_depth": encoder_depth, "predictor_depth": predictor_depth,
-            "checkpoint_path": str(lejepa_ckpt),
-        }
-        ft_sub = _run_eval_subprocess("fine_tuning", ft_cfg, timeout=3600)
-        if ft_sub and "error" not in ft_sub:
-            ft_results = ft_sub
-        else:
-            err_msg = ft_sub.get("error", "unknown") if ft_sub else "crashed"
-            print(f"  Fine-tuning failed: {err_msg}")
-
-        # Restore LeJEPA to GPU for next dataset
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-        lejepa.to(device)
-
+        # ── Save partial results NOW (before fine-tuning subprocess) ──
+        # Linear probe / few-shot / n-shot / baselines are already complete.
+        # Saving here ensures those results are never lost if fine-tuning
+        # crashes, times out, or is killed.
         all_results[name] = {
             "type": "classification",
             "description": cfg["description"],
@@ -1420,16 +1451,68 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 "accuracy": inet_results["accuracy"],
                 "auc": inet_results.get("auc"),
             },
-            "fine_tuning": {
-                "accuracy": ft_results["accuracy"],
-                "auc": ft_results.get("auc"),
-            },
+            "fine_tuning": {"accuracy": None, "auc": None},  # filled in below
         }
-
-        # Save partial results after each dataset (crash-safe)
         _partial_dir = Path(args.results_dir)
         _partial_dir.mkdir(parents=True, exist_ok=True)
         _partial_path = _partial_dir / "evaluation_results_partial.json"
+        with open(_partial_path, "w") as _pf:
+            json.dump(all_results, _pf, indent=2, default=str)
+        print(f"  [Saved partial results (pre-fine-tuning) to {_partial_path}]")
+
+        # Full Fine-Tuning — run in subprocess to isolate OOM/crashes
+        ft_results = {"accuracy": None, "auc": None}
+        if getattr(args, 'skip_finetune', False):
+            print(f"\n[{name}] Full Fine-Tuning ... SKIPPED (--skip_finetune)")
+        else:
+            print(f"\n[{name}] Full Fine-Tuning ... (subprocess)")
+            # Free extracted features before fine-tuning to reclaim memory
+            try:
+                del train_feats, test_feats, train_labels, test_labels
+                del _train_labels_1d, _test_labels_1d
+            except NameError:
+                pass
+            try:
+                del _nshot_test_feats, _nshot_test_labels_1d
+            except NameError:
+                pass
+            gc.collect()
+
+            lejepa.cpu()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+            ft_cfg = {
+                "name": name, "dataset_cfg": cfg,
+                "image_size": image_size, "num_classes": num_classes,
+                "batch_size": args.batch_size, "num_workers": args.num_workers,
+                "max_samples": args.max_samples,
+                "train_indices": _train_indices,
+                "test_indices": _test_indices,
+                "patch_size": patch_size, "embed_dim": embed_dim,
+                "encoder_depth": encoder_depth, "predictor_depth": predictor_depth,
+                "checkpoint_path": str(lejepa_ckpt),
+                "multi_label": _multi_label,
+            }
+            ft_sub = _run_eval_subprocess("fine_tuning", ft_cfg, timeout=3600)
+            if ft_sub and "error" not in ft_sub:
+                ft_results = ft_sub
+            else:
+                err_msg = ft_sub.get("error", "unknown") if ft_sub else "crashed"
+                print(f"  Fine-tuning failed: {err_msg}")
+
+            # Restore LeJEPA to GPU for next dataset
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            lejepa.to(device)
+
+        # Update fine-tuning result and save final partial results
+        all_results[name]["fine_tuning"] = {
+            "accuracy": ft_results["accuracy"],
+            "auc": ft_results.get("auc"),
+        }
         with open(_partial_path, "w") as _pf:
             json.dump(all_results, _pf, indent=2, default=str)
         print(f"  [Saved partial results to {_partial_path}]")
