@@ -133,6 +133,7 @@ def run_fine_tuning(cfg):
     checkpoint_path = cfg["checkpoint_path"]
     max_samples = cfg.get("max_samples")
     multi_label = cfg.get("multi_label", False)
+    result_path = cfg.get("_result_path")  # early-write path
     ds_name = cfg["name"]
     ds_cfg = cfg["dataset_cfg"]
 
@@ -185,6 +186,16 @@ def run_fine_tuning(cfg):
         print(f"  Fine-Tune AUC:      {ft_results['auc']:.4f}")
 
     ft_results.pop("report", None)
+
+    # Write result JSON IMMEDIATELY — before cleanup.
+    # The OOM killer strikes during gc.collect()/cuda.empty_cache(),
+    # so we persist results while they're still available.
+    if result_path:
+        try:
+            with open(result_path, "w") as _rf:
+                json.dump(ft_results, _rf)
+        except Exception:
+            pass
 
     # Explicit cleanup before exit
     del ft_eval, ft_model, train_loader, test_loader, train_ds, test_ds, ds
@@ -241,6 +252,7 @@ def main():
         cfg["_result_path"] = args.result  # allow early-write
         results = run_imagenet_baseline(cfg)
     elif args.task == "fine_tuning":
+        cfg["_result_path"] = args.result  # allow early-write
         results = run_fine_tuning(cfg)
     else:
         results = {"error": f"Unknown task: {args.task}"}
