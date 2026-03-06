@@ -183,6 +183,11 @@ class FineTuneEvaluator:
                 print(f"  FT Epoch {epoch+1}/{self.num_epochs} | "
                       f"Loss: {avg_loss:.4f}", flush=True)
 
+            # Release cached GPU allocations between epochs to prevent
+            # fragmentation that pushes system RAM via pinned-memory growth.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         # Sync EMA encoder with fine-tuned encoder weights so
         # encode() (used during evaluation) reflects the fine-tuned state
         if hasattr(self.model, 'ema_encoder') and self.model.ema_encoder is not None:
@@ -197,16 +202,35 @@ class FineTuneEvaluator:
     def _evaluate_loader(self, loader: DataLoader) -> float:
         self.model.eval()
         self.head.eval()
-        eval_loader = DataLoader(
-            loader.dataset, batch_size=self.batch_size * 4,
-            num_workers=min(getattr(loader, 'num_workers', 0), 2),
-            pin_memory=torch.cuda.is_available(),
-        )
+        # Reuse a cached val DataLoader — creating a new one every epoch
+        # leaks pinned-memory page-table entries on some CUDA drivers.
+        if not hasattr(self, '_cached_val_loader') or self._cached_val_loader is None:
+            self._cached_val_loader = DataLoader(
+                loader.dataset, batch_size=self.batch_size * 2,
+                num_workers=0,
+                pin_memory=torch.cuda.is_available(),
+            )
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for images, labels in eval_loader:
+            for images, labels in self._cached_val_loader:
                 images = images.to(self.device)
-                features = self.model.encode(images)
+                # Use the online encoder directly — the EMA encoder may be
+                # offloaded to CPU during fine-tuning to save GPU memory.
+                encoder = self.model.encoder if hasattr(self.model, 'encoder') else self.model
+                if hasattr(self.model, 'multiscale_layers') and self.model.multiscale_layers > 1:
+                    x = encoder.patch_embed(images)
+                    x = x + encoder.pos_embed
+                    layer_outputs = []
+                    for block in encoder.blocks:
+                        x = block(x)
+                        layer_outputs.append(x)
+                    n = min(self.model.multiscale_layers, len(layer_outputs))
+                    stacked = torch.stack(layer_outputs[-n:], dim=0)
+                    pooled = stacked.mean(dim=0)
+                    pooled = encoder.norm(pooled)
+                    features = pooled.mean(dim=1)
+                else:
+                    features = encoder(images).mean(dim=1)
                 logits = self.head(features)
                 if self.multi_label:
                     preds = (torch.sigmoid(logits) >= 0.5).int().cpu()

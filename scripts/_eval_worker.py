@@ -156,8 +156,10 @@ def run_fine_tuning(cfg):
         pin_memory=torch.cuda.is_available(),
     )
 
-    # Load checkpoint
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # Load checkpoint to CPU first — loading directly to CUDA would place
+    # the optimizer state dict (~700 MB) on GPU unnecessarily, spiking
+    # memory before we even build the model.
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     ft_model = LeJEPA(
         image_size=image_size, patch_size=patch_size,
@@ -169,6 +171,10 @@ def run_fine_tuning(cfg):
     ft_model.load_state_dict(ft_state, strict=False)
     if "ema_encoder_state_dict" in ckpt:
         ft_model.ema_encoder.load_state_dict(ckpt["ema_encoder_state_dict"])
+    # Free the raw checkpoint dict — it holds optimizer states and a second copy
+    # of all weight tensors (~1.5-2 GB CPU RAM) that are no longer needed.
+    del ckpt, ft_state
+    gc.collect()
     ft_model = ft_model.to(device)
 
     ft_eval = FineTuneEvaluator(
@@ -178,7 +184,30 @@ def run_fine_tuning(cfg):
         num_epochs=20,
         multi_label=multi_label,
     )
+
+    # Offload EMA encoder and predictor to CPU during training — they are
+    # NOT used in the train loop (encode_with_grad uses self.encoder, not
+    # EMA) but consume ~400 MB GPU + host pinned memory.  Restoring EMA
+    # before evaluate() is enough.
+    _ema_offloaded = False
+    if hasattr(ft_eval.model, 'ema_encoder') and ft_eval.model.ema_encoder is not None:
+        ft_eval.model.ema_encoder.cpu()
+        _ema_offloaded = True
+    if hasattr(ft_eval.model, 'predictor') and ft_eval.model.predictor is not None:
+        ft_eval.model.predictor.cpu()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     ft_history = ft_eval.train(train_loader, test_loader)
+
+    # Restore EMA to GPU for evaluation (encode() uses EMA encoder)
+    if _ema_offloaded and ft_eval.model.ema_encoder is not None:
+        ft_eval.model.ema_encoder.to(device)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     ft_results = ft_eval.evaluate(test_loader)
 
     print(f"  Fine-Tune Accuracy: {ft_results['accuracy']:.4f}")

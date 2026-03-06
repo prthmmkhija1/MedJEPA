@@ -1282,6 +1282,12 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
     # Load EMA encoder weights if available (used for inference)
     if "ema_encoder_state_dict" in ckpt:
         lejepa.ema_encoder.load_state_dict(ckpt["ema_encoder_state_dict"])
+    # Free the raw checkpoint dict immediately — it holds optimizer states and
+    # all weight tensors a second time, which can be 1.5-2 GB of CPU RAM.
+    # Keeping it alive causes OOM kills when the fine-tuning subprocess then
+    # loads its own copy of the same checkpoint.
+    del ckpt, state
+    gc.collect()
     lejepa = lejepa.to(device)
     lejepa.eval()
     print("LeJEPA loaded!\n")
