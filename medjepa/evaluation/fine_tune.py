@@ -47,9 +47,9 @@ class FineTuneEvaluator:
         encoder_lr: float = 1e-5,
         head_lr: float = 1e-3,
         num_epochs: int = 30,
-        batch_size: int = 16,
+        batch_size: int = 128,
         weight_decay: float = 0.01,
-        grad_accum_steps: int = 4,
+        grad_accum_steps: int = 1,
         multi_label: bool = False,
     ):
         self.device = get_device()
@@ -135,6 +135,7 @@ class FineTuneEvaluator:
             criterion = nn.CrossEntropyLoss()
 
         history = {"train_loss": [], "val_acc": []}
+        _log_every = 100  # print step-level progress every N steps
 
         for epoch in range(self.num_epochs):
             # --- Train ---
@@ -142,6 +143,7 @@ class FineTuneEvaluator:
             self.head.train()
             epoch_loss = 0.0
             n_batches = 0
+            total_steps = len(train_loader)
 
             optimizer.zero_grad()
             for step, batch in enumerate(train_loader):
@@ -159,7 +161,7 @@ class FineTuneEvaluator:
                     loss = criterion(logits, labels) / self.grad_accum_steps
                 loss.backward()
 
-                if (step + 1) % self.grad_accum_steps == 0 or (step + 1) == len(train_loader):
+                if (step + 1) % self.grad_accum_steps == 0 or (step + 1) == total_steps:
                     torch.nn.utils.clip_grad_norm_(
                         list(encoder_params) + head_params, max_norm=1.0,
                     )
@@ -168,6 +170,10 @@ class FineTuneEvaluator:
 
                 epoch_loss += loss.item() * self.grad_accum_steps
                 n_batches += 1
+
+                if (step + 1) % _log_every == 0 or (step + 1) == total_steps:
+                    running_avg = epoch_loss / n_batches
+                    print(f"    step {step+1}/{total_steps} | loss {running_avg:.4f}", flush=True)
 
             scheduler.step()
             avg_loss = epoch_loss / max(n_batches, 1)
@@ -206,7 +212,7 @@ class FineTuneEvaluator:
         # leaks pinned-memory page-table entries on some CUDA drivers.
         if not hasattr(self, '_cached_val_loader') or self._cached_val_loader is None:
             self._cached_val_loader = DataLoader(
-                loader.dataset, batch_size=self.batch_size * 2,
+                loader.dataset, batch_size=self.batch_size * 4,
                 num_workers=0,
                 pin_memory=torch.cuda.is_available(),
             )

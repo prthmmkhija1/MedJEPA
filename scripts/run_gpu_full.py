@@ -366,6 +366,8 @@ def parse_args():
                    help="Backbone for ImageNet baseline (resnet50 uses ~4x less memory)")
     p.add_argument("--skip_finetune", action="store_true",
                    help="Skip full fine-tuning evaluation (saves time; linear probe results still run)")
+    p.add_argument("--ft_epochs", type=int, default=10,
+                   help="Number of fine-tuning epochs per dataset (default: 10)")
 
     raw = p.parse_args()
 
@@ -1316,20 +1318,60 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         except Exception as _e:
             print(f"[Resume] Could not load partial results: {_e}")
 
+    # -- Helper: save partial results to disk immediately --
+    _partial_dir = Path(args.results_dir)
+    _partial_dir.mkdir(parents=True, exist_ok=True)
+    _partial_path = _partial_dir / "evaluation_results_partial.json"
+
+    def _save_partial():
+        with open(_partial_path, "w") as _pf:
+            json.dump(all_results, _pf, indent=2, default=str)
+
+    # -- Helper: check if a sub-step is already done for a dataset --
+    def _step_done(ds_name, step_key):
+        """Return True if `step_key` already has a non-None accuracy/value in partial results."""
+        prior = all_results.get(ds_name, {})
+        val = prior.get(step_key)
+        if val is None:
+            return False
+        if isinstance(val, dict):
+            # Supports both "accuracy" (classification) and "mean_dice" (segmentation)
+            return val.get("accuracy") is not None or val.get("mean_dice") is not None
+        if isinstance(val, (int, float)):
+            return True  # direct numeric value (e.g. mean_dice stored as float)
+        if isinstance(val, list) and len(val) > 0:
+            return True  # few_shot is a list
+        return bool(val)
+
     # -- Evaluate 2D datasets --
     for name, cfg in DATASETS_2D.items():
         if not check_dataset_exists(cfg):
             print(f"  SKIP {name}: data not found")
             continue
 
-        # Resume: skip datasets that already have a complete fine-tuning result
-        _prior = all_results.get(name, {})
-        _prior_ft_acc = _prior.get("fine_tuning", {}).get("accuracy") if _prior else None
-        if _prior_ft_acc is not None:
-            print(f"  SKIP {name}: already evaluated (FT acc={_prior_ft_acc:.4f}), loaded from partial results")
+        # Determine which steps still need to run for this dataset
+        _steps_needed = []
+        for _sk in ["linear_probing", "few_shot", "n_shot", "supervised_baseline",
+                     "imagenet_baseline", "fine_tuning"]:
+            if not _step_done(name, _sk):
+                _steps_needed.append(_sk)
+
+        if not _steps_needed:
+            _prior = all_results.get(name, {})
+            _ft_acc = _prior.get("fine_tuning", {}).get("accuracy", "N/A")
+            print(f"  SKIP {name}: all steps complete (FT acc={_ft_acc}), loaded from partial results")
             continue
 
         banner(f"Evaluating: {name.upper()} -- {cfg['description']}")
+        print(f"  Steps remaining: {', '.join(_steps_needed)}")
+
+        # Initialise result dict if this is a fresh dataset
+        if name not in all_results:
+            all_results[name] = {
+                "type": "classification",
+                "description": cfg["description"],
+                "num_classes": cfg["num_classes"],
+            }
 
         try:
             ds = load_2d_dataset(name, cfg, args.image_size,
@@ -1371,6 +1413,7 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         )
 
         num_classes = cfg["num_classes"]
+        _multi_label = (name == "chestxray14")
 
         # Lazy-restore LeJEPA to GPU (it may have been left on CPU after previous subprocess)
         if next(lejepa.parameters()).device.type == "cpu":
@@ -1378,128 +1421,165 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # Linear Probe
-        print(f"\n[{name}] Linear Probing ...")
-        _multi_label = (name == "chestxray14")
-        lp = LinearProbeEvaluator(
-            pretrained_model=lejepa,
-            num_classes=num_classes,
-            embed_dim=embed_dim,
-            multi_label=_multi_label,
-        )
-        train_feats, train_labels = lp.extract_features(train_loader)
-        test_feats, test_labels = lp.extract_features(test_loader)
-        print(f"  Train features: {train_feats.shape}")
-        print(f"  Test  features: {test_feats.shape}")
+        # ── Features needed for linear_probe / few_shot / n_shot / supervised_baseline ──
+        _need_features = any(s in _steps_needed for s in
+                             ["linear_probing", "few_shot", "n_shot", "supervised_baseline"])
+        train_feats = test_feats = train_labels = test_labels = None
+        lp_results = all_results[name].get("linear_probing", {})
 
-        lp.train_probe(train_feats, train_labels)
-        lp_results = lp.evaluate(test_feats, test_labels)
-        print(f"  Linear Probe Accuracy: {lp_results['accuracy']:.4f}")
-        if lp_results.get("auc"):
-            print(f"  Linear Probe AUC:      {lp_results['auc']:.4f}")
+        if _need_features:
+            print(f"\n[{name}] Extracting features ...")
+            lp = LinearProbeEvaluator(
+                pretrained_model=lejepa,
+                num_classes=num_classes,
+                embed_dim=embed_dim,
+                multi_label=_multi_label,
+            )
+            train_feats, train_labels = lp.extract_features(train_loader)
+            test_feats, test_labels = lp.extract_features(test_loader)
+            print(f"  Train features: {train_feats.shape}")
+            print(f"  Test  features: {test_feats.shape}")
+
+        # ── Step: Linear Probe ──
+        if "linear_probing" in _steps_needed:
+            print(f"\n[{name}] Linear Probing ...")
+            lp.train_probe(train_feats, train_labels)
+            lp_results = lp.evaluate(test_feats, test_labels)
+            print(f"  Linear Probe Accuracy: {lp_results['accuracy']:.4f}")
+            if lp_results.get("auc"):
+                print(f"  Linear Probe AUC:      {lp_results['auc']:.4f}")
+            all_results[name]["linear_probing"] = {
+                "accuracy": lp_results["accuracy"],
+                "auc": lp_results.get("auc"),
+            }
+            _save_partial()
+            print(f"  [Saved linear_probing result]")
+        else:
+            print(f"\n[{name}] Linear Probing ... SKIPPED (already done)")
 
         # For multi-label datasets (ChestXray14), KNN-based evaluators
         # need single integer labels.  Convert multi-hot → argmax.
-        if _multi_label and train_labels.dim() == 2:
+        if _need_features and _multi_label and train_labels.dim() == 2:
             _train_labels_1d = train_labels.argmax(dim=1)
             _test_labels_1d = test_labels.argmax(dim=1)
-        else:
+        elif _need_features:
             _train_labels_1d = train_labels
             _test_labels_1d = test_labels
+        else:
+            _train_labels_1d = _test_labels_1d = None
 
-        # Few-Shot / Data Efficiency
-        print(f"\n[{name}] Few-Shot (Data Efficiency) ...")
-        fs = FewShotEvaluator(pretrained_model=lejepa)
-        fs_results = fs.evaluate_data_efficiency(
-            train_feats, _train_labels_1d,
-            test_feats, _test_labels_1d,
-            fractions=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
-        )
+        # ── Step: Few-Shot / Data Efficiency ──
+        if "few_shot" in _steps_needed:
+            print(f"\n[{name}] Few-Shot (Data Efficiency) ...")
+            fs = FewShotEvaluator(pretrained_model=lejepa)
+            fs_results = fs.evaluate_data_efficiency(
+                train_feats, _train_labels_1d,
+                test_feats, _test_labels_1d,
+                fractions=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
+            )
+            all_results[name]["few_shot"] = fs_results
+            _save_partial()
+            print(f"  [Saved few_shot result]")
+        else:
+            print(f"\n[{name}] Few-Shot ... SKIPPED (already done)")
 
-        # N-Shot Evaluation (5-shot, 10-shot, 20-shot per class)
-        print(f"\n[{name}] N-Shot Classification (5/10/20-shot) ...")
-        n_shot_results = {}
-        unique_classes = torch.unique(_train_labels_1d)
-        # Subsample test features for kNN if dataset is very large
-        _nshot_test_feats = test_feats
-        _nshot_test_labels_1d = _test_labels_1d
-        if len(_test_labels_1d) > 20000:
-            _rng = np.random.RandomState(42)
-            _idx = _rng.choice(len(_test_labels_1d), 20000, replace=False)
-            _nshot_test_feats = test_feats[_idx]
-            _nshot_test_labels_1d = _test_labels_1d[_idx]
-        for n_shot in [5, 10, 20]:
-            # Sample n_shot examples per class from training features
-            support_idx = []
-            for cls in unique_classes:
-                cls_idx = (_train_labels_1d == cls).nonzero(as_tuple=True)[0]
-                if len(cls_idx) >= n_shot:
-                    perm = cls_idx[torch.randperm(len(cls_idx))[:n_shot]]
-                else:
-                    perm = cls_idx  # use all available if fewer than n_shot
-                support_idx.append(perm)
-            support_idx = torch.cat(support_idx)
-            support_feats = train_feats[support_idx]
-            support_labs = _train_labels_1d[support_idx]
+        # ── Step: N-Shot Evaluation (5/10/20-shot per class) ──
+        if "n_shot" in _steps_needed:
+            print(f"\n[{name}] N-Shot Classification (5/10/20-shot) ...")
+            n_shot_results = {}
+            unique_classes = torch.unique(_train_labels_1d)
+            # Subsample test features for kNN if dataset is very large
+            _nshot_test_feats = test_feats
+            _nshot_test_labels_1d = _test_labels_1d
+            if len(_test_labels_1d) > 20000:
+                _rng = np.random.RandomState(42)
+                _idx = _rng.choice(len(_test_labels_1d), 20000, replace=False)
+                _nshot_test_feats = test_feats[_idx]
+                _nshot_test_labels_1d = _test_labels_1d[_idx]
+            for n_shot in [5, 10, 20]:
+                support_idx = []
+                for cls in unique_classes:
+                    cls_idx = (_train_labels_1d == cls).nonzero(as_tuple=True)[0]
+                    if len(cls_idx) >= n_shot:
+                        perm = cls_idx[torch.randperm(len(cls_idx))[:n_shot]]
+                    else:
+                        perm = cls_idx
+                    support_idx.append(perm)
+                support_idx = torch.cat(support_idx)
+                support_feats = train_feats[support_idx]
+                support_labs = _train_labels_1d[support_idx]
 
-            from sklearn.neighbors import KNeighborsClassifier
-            from sklearn.metrics import accuracy_score
-            k = min(5, len(support_labs))
-            knn = KNeighborsClassifier(n_neighbors=max(1, k), algorithm='ball_tree')
-            knn.fit(support_feats.numpy(), support_labs.numpy())
-            preds = knn.predict(_nshot_test_feats.numpy())
-            acc = accuracy_score(_nshot_test_labels_1d.numpy(), preds)
-            n_shot_results[f"{n_shot}-shot"] = {
-                "accuracy": acc,
-                "num_support": len(support_labs),
+                from sklearn.neighbors import KNeighborsClassifier
+                from sklearn.metrics import accuracy_score
+                k = min(5, len(support_labs))
+                knn = KNeighborsClassifier(n_neighbors=max(1, k), algorithm='ball_tree')
+                knn.fit(support_feats.numpy(), support_labs.numpy())
+                preds = knn.predict(_nshot_test_feats.numpy())
+                acc = accuracy_score(_nshot_test_labels_1d.numpy(), preds)
+                n_shot_results[f"{n_shot}-shot"] = {
+                    "accuracy": acc,
+                    "num_support": len(support_labs),
+                }
+                print(f"  {n_shot}-shot: Accuracy = {acc:.4f} ({len(support_labs)} support samples)")
+            all_results[name]["n_shot"] = n_shot_results
+            _save_partial()
+            print(f"  [Saved n_shot result]")
+        else:
+            print(f"\n[{name}] N-Shot ... SKIPPED (already done)")
+
+        # ── Step: Supervised Baseline (random init model, same linear probe) ──
+        baseline_results = all_results[name].get("supervised_baseline", {})
+        if "supervised_baseline" in _steps_needed:
+            print(f"\n[{name}] Supervised Baseline (random init) ...")
+            baseline_model = LeJEPA(
+                image_size=image_size,
+                patch_size=patch_size,
+                embed_dim=embed_dim,
+                encoder_depth=encoder_depth,
+                predictor_depth=predictor_depth,
+            ).to(device)
+            baseline_model.eval()
+
+            baseline_lp = LinearProbeEvaluator(
+                pretrained_model=baseline_model,
+                num_classes=num_classes,
+                embed_dim=embed_dim,
+                multi_label=_multi_label,
+            )
+            baseline_train_feats, baseline_train_labels = baseline_lp.extract_features(train_loader)
+            baseline_test_feats, baseline_test_labels = baseline_lp.extract_features(test_loader)
+            baseline_lp.train_probe(baseline_train_feats, baseline_train_labels)
+            baseline_results = baseline_lp.evaluate(baseline_test_feats, baseline_test_labels)
+            print(f"  Baseline Accuracy: {baseline_results['accuracy']:.4f}")
+            print(f"  MedJEPA  Accuracy: {lp_results.get('accuracy', 'N/A')}")
+            if lp_results.get('accuracy') is not None:
+                improvement = lp_results['accuracy'] - baseline_results['accuracy']
+                print(f"  Improvement:       {improvement:+.4f}")
+
+            del baseline_model, baseline_lp
+            del baseline_train_feats, baseline_test_feats
+            del baseline_train_labels, baseline_test_labels
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            all_results[name]["supervised_baseline"] = {
+                "accuracy": baseline_results["accuracy"],
+                "auc": baseline_results.get("auc"),
             }
-            print(f"  {n_shot}-shot: Accuracy = {acc:.4f} ({len(support_labs)} support samples)")
+            _save_partial()
+            print(f"  [Saved supervised_baseline result]")
+        else:
+            print(f"\n[{name}] Supervised Baseline ... SKIPPED (already done)")
 
-        # Supervised Baseline (random init model, same linear probe)
-        print(f"\n[{name}] Supervised Baseline (random init) ...")
-        baseline_model = LeJEPA(
-            image_size=image_size,
-            patch_size=patch_size,
-            embed_dim=embed_dim,
-            encoder_depth=encoder_depth,
-            predictor_depth=predictor_depth,
-        ).to(device)
-        baseline_model.eval()
-
-        baseline_lp = LinearProbeEvaluator(
-            pretrained_model=baseline_model,
-            num_classes=num_classes,
-            embed_dim=embed_dim,
-            multi_label=_multi_label,
-        )
-        baseline_train_feats, baseline_train_labels = baseline_lp.extract_features(train_loader)
-        baseline_test_feats, baseline_test_labels = baseline_lp.extract_features(test_loader)
-        baseline_lp.train_probe(baseline_train_feats, baseline_train_labels)
-        baseline_results = baseline_lp.evaluate(baseline_test_feats, baseline_test_labels)
-        print(f"  Baseline Accuracy: {baseline_results['accuracy']:.4f}")
-        print(f"  MedJEPA  Accuracy: {lp_results['accuracy']:.4f}")
-        improvement = lp_results['accuracy'] - baseline_results['accuracy']
-        print(f"  Improvement:       {improvement:+.4f}")
-
-        del baseline_model  # free memory
-        # Free ALL baseline GPU objects to maximise room for next evaluations
-        del baseline_lp, lp
-        del baseline_train_feats, baseline_test_feats
-        del baseline_train_labels, baseline_test_labels
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # ── Collect train/test indices for subprocess evaluations ──
-        # Resolve through any nested Subset wrappers (e.g. max_samples)
-        # so the subprocess can load the raw dataset and use absolute indices.
+        # Free feature tensors and loaders before heavy GPU evals
+        if _need_features:
+            try:
+                del lp
+            except NameError:
+                pass
         _train_indices = _resolve_subset_indices(train_ds)
         _test_indices = _resolve_subset_indices(test_ds)
-
-        # Free ALL feature tensors, dataloaders, and datasets NOW.
-        # The in-process imagenet/fine-tuning evals create their own data
-        # pipelines from the resolved indices, so these are no longer needed.
-        # Freeing early reduces peak RSS during the subsequent GPU-heavy steps.
         try:
             del train_feats, test_feats, train_labels, test_labels
             del _train_labels_1d, _test_labels_1d
@@ -1514,118 +1594,94 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # ImageNet Pretrained Baseline — run directly in this process.
-        # Previously this used a subprocess to isolate crashes, but spawning
-        # a second Python interpreter doubles the RSS and triggers the OOM
-        # killer on memory-constrained containers.  In-process execution
-        # keeps a single interpreter; we move LeJEPA to CPU to free GPU
-        # memory before loading ResNet50, then restore it afterwards.
+        # ── Step: ImageNet Pretrained Baseline ──
         _backbone = getattr(args, 'imagenet_backbone', 'resnet50')
-        inet_results = {"accuracy": None, "auc": None}
+        inet_results = all_results[name].get("imagenet_baseline", {"accuracy": None, "auc": None})
 
-        # ── Move LeJEPA to CPU to free GPU memory for subsequent evals ──
+        # Move LeJEPA to CPU to free GPU memory for ImageNet/fine-tuning
         lejepa.cpu()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        if getattr(args, 'skip_imagenet', False):
-            print(f"\n[{name}] ImageNet Baseline ... SKIPPED (--skip_imagenet)")
-        else:
-            print(f"\n[{name}] ImageNet {_backbone} Baseline ... (in-process)")
+        if "imagenet_baseline" in _steps_needed:
+            if getattr(args, 'skip_imagenet', False):
+                print(f"\n[{name}] ImageNet Baseline ... SKIPPED (--skip_imagenet)")
+            else:
+                print(f"\n[{name}] ImageNet {_backbone} Baseline ... (in-process)")
+                inet_cfg = {
+                    "name": name, "dataset_cfg": cfg,
+                    "image_size": image_size, "num_classes": num_classes,
+                    "batch_size": args.batch_size, "num_workers": args.num_workers,
+                    "max_samples": args.max_samples,
+                    "train_indices": _train_indices,
+                    "test_indices": _test_indices,
+                    "multi_label": _multi_label,
+                    "backbone": _backbone,
+                }
+                try:
+                    inet_results = run_imagenet_baseline(inet_cfg)
+                    if lp_results.get('accuracy') is not None:
+                        print(f"  MedJEPA LP Accuracy:        {lp_results['accuracy']:.4f}")
+                        inet_imp = lp_results['accuracy'] - inet_results['accuracy']
+                        print(f"  MedJEPA vs ImageNet:        {inet_imp:+.4f}")
+                except Exception as _ie:
+                    print(f"  ImageNet baseline failed: {_ie}")
 
-            inet_cfg = {
-                "name": name, "dataset_cfg": cfg,
-                "image_size": image_size, "num_classes": num_classes,
-                "batch_size": args.batch_size, "num_workers": args.num_workers,
-                "max_samples": args.max_samples,
-                "train_indices": _train_indices,
-                "test_indices": _test_indices,
-                "multi_label": _multi_label,
-                "backbone": _backbone,
-            }
-            try:
-                inet_results = run_imagenet_baseline(inet_cfg)
-                print(f"  MedJEPA LP Accuracy:        {lp_results['accuracy']:.4f}")
-                inet_imp = lp_results['accuracy'] - inet_results['accuracy']
-                print(f"  MedJEPA vs ImageNet:        {inet_imp:+.4f}")
-            except Exception as _ie:
-                print(f"  ImageNet baseline failed: {_ie}")
-
-        # ── Save partial results NOW (before fine-tuning subprocess) ──
-        # Linear probe / few-shot / n-shot / baselines are already complete.
-        # Saving here ensures those results are never lost if fine-tuning
-        # crashes, times out, or is killed.
-        all_results[name] = {
-            "type": "classification",
-            "description": cfg["description"],
-            "num_classes": num_classes,
-            "linear_probing": {
-                "accuracy": lp_results["accuracy"],
-                "auc": lp_results.get("auc"),
-            },
-            "few_shot": fs_results,
-            "n_shot": n_shot_results,
-            "supervised_baseline": {
-                "accuracy": baseline_results["accuracy"],
-                "auc": baseline_results.get("auc"),
-            },
-            "imagenet_baseline": {
-                "accuracy": inet_results["accuracy"],
+            all_results[name]["imagenet_baseline"] = {
+                "accuracy": inet_results.get("accuracy"),
                 "auc": inet_results.get("auc"),
-            },
-            "fine_tuning": {"accuracy": None, "auc": None},  # filled in below
-        }
-        _partial_dir = Path(args.results_dir)
-        _partial_dir.mkdir(parents=True, exist_ok=True)
-        _partial_path = _partial_dir / "evaluation_results_partial.json"
-        with open(_partial_path, "w") as _pf:
-            json.dump(all_results, _pf, indent=2, default=str)
-        print(f"  [Saved partial results (pre-fine-tuning) to {_partial_path}]")
-
-        # Full Fine-Tuning — run directly in this process (no subprocess).
-        ft_results = {"accuracy": None, "auc": None}
-        if getattr(args, 'skip_finetune', False):
-            print(f"\n[{name}] Full Fine-Tuning ... SKIPPED (--skip_finetune)")
-        else:
-            print(f"\n[{name}] Full Fine-Tuning ... (in-process)")
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            ft_cfg = {
-                "name": name, "dataset_cfg": cfg,
-                "image_size": image_size, "num_classes": num_classes,
-                "batch_size": args.batch_size, "num_workers": args.num_workers,
-                "max_samples": args.max_samples,
-                "train_indices": _train_indices,
-                "test_indices": _test_indices,
-                "patch_size": patch_size, "embed_dim": embed_dim,
-                "encoder_depth": encoder_depth, "predictor_depth": predictor_depth,
-                "checkpoint_path": str(lejepa_ckpt),
-                "multi_label": _multi_label,
             }
-            try:
-                ft_results = run_fine_tuning(ft_cfg)
-            except Exception as _fe:
-                print(f"  Fine-tuning failed: {_fe}")
+            _save_partial()
+            print(f"  [Saved imagenet_baseline result]")
+        else:
+            print(f"\n[{name}] ImageNet Baseline ... SKIPPED (already done)")
 
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        # ── Step: Full Fine-Tuning ──
+        if "fine_tuning" in _steps_needed:
+            ft_results = {"accuracy": None, "auc": None}
+            if getattr(args, 'skip_finetune', False):
+                print(f"\n[{name}] Full Fine-Tuning ... SKIPPED (--skip_finetune)")
+            else:
+                print(f"\n[{name}] Full Fine-Tuning ... (in-process)")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                ft_cfg = {
+                    "name": name, "dataset_cfg": cfg,
+                    "image_size": image_size, "num_classes": num_classes,
+                    "batch_size": args.batch_size, "num_workers": args.num_workers,
+                    "max_samples": args.max_samples,
+                    "train_indices": _train_indices,
+                    "test_indices": _test_indices,
+                    "patch_size": patch_size, "embed_dim": embed_dim,
+                    "encoder_depth": encoder_depth, "predictor_depth": predictor_depth,
+                    "checkpoint_path": str(lejepa_ckpt),
+                    "multi_label": _multi_label,
+                    "ft_epochs": getattr(args, "ft_epochs", 10),
+                }
+                try:
+                    ft_results = run_fine_tuning(ft_cfg)
+                except Exception as _fe:
+                    print(f"  Fine-tuning failed: {_fe}")
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            all_results[name]["fine_tuning"] = {
+                "accuracy": ft_results.get("accuracy"),
+                "auc": ft_results.get("auc"),
+            }
+            _save_partial()
+            print(f"  [Saved fine_tuning result]")
+        else:
+            print(f"\n[{name}] Full Fine-Tuning ... SKIPPED (already done)")
 
         # ── Restore LeJEPA to GPU for the next dataset ──
         lejepa.to(device)
         lejepa.eval()
-
-        # Update fine-tuning result and save final partial results
-        all_results[name]["fine_tuning"] = {
-            "accuracy": ft_results["accuracy"],
-            "auc": ft_results.get("auc"),
-        }
-        with open(_partial_path, "w") as _pf:
-            json.dump(all_results, _pf, indent=2, default=str)
-        print(f"  [Saved partial results to {_partial_path}]")
 
     # -- Evaluate 3D datasets (as 2D slices through LeJEPA) --
     for name, cfg in DATASETS_3D.items():
@@ -1633,7 +1689,25 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             print(f"  SKIP {name}: data not found")
             continue
 
+        # Determine which steps still need to run
+        _steps_needed = []
+        for _sk in ["linear_probing", "few_shot", "n_shot", "supervised_baseline"]:
+            if not _step_done(name, _sk):
+                _steps_needed.append(_sk)
+
+        if not _steps_needed:
+            print(f"  SKIP {name}: all steps complete, loaded from partial results")
+            continue
+
         banner(f"Evaluating: {name.upper()} -- {cfg['description']}")
+        print(f"  Steps remaining: {', '.join(_steps_needed)}")
+
+        if name not in all_results:
+            all_results[name] = {
+                "type": "3d_as_2d_slices",
+                "description": cfg["description"],
+                "num_classes": cfg.get("num_classes", 2),
+            }
 
         try:
             ds = load_3d_slice_dataset(name, cfg, args.image_size,
@@ -1650,12 +1724,9 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         has_labels = hasattr(ds, 'labels') and ds.labels is not None
         if not has_labels:
             print(f"  No labels for {name}, evaluating without classification.")
-            all_results[name] = {
-                "type": "3d_slices",
-                "description": cfg["description"],
-                "num_slices": len(ds),
-                "note": "No labels available for classification",
-            }
+            all_results[name]["note"] = "No labels available for classification"
+            all_results[name]["num_slices"] = len(ds)
+            _save_partial()
             continue
 
         # Split and evaluate like 2D
@@ -1681,121 +1752,148 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
         )
 
         num_classes = cfg.get("num_classes", 2)
+        all_results[name]["num_slices"] = len(ds)
+        all_results[name]["num_classes"] = num_classes
 
-        print(f"\n[{name}] Linear Probing (slice-level) ...")
-        lp = LinearProbeEvaluator(
-            pretrained_model=lejepa,
-            num_classes=num_classes,
-            embed_dim=embed_dim,
-        )
-        train_feats, train_labels = lp.extract_features(train_loader)
-        test_feats, test_labels = lp.extract_features(test_loader)
-        print(f"  Train features: {train_feats.shape}")
-        print(f"  Test  features: {test_feats.shape}")
+        _need_features = any(s in _steps_needed for s in
+                             ["linear_probing", "few_shot", "n_shot", "supervised_baseline"])
+        train_feats = test_feats = train_labels = test_labels = None
+        lp_results = all_results[name].get("linear_probing", {})
 
-        lp.train_probe(train_feats, train_labels)
-        lp_results = lp.evaluate(test_feats, test_labels)
-        print(f"  Linear Probe Accuracy: {lp_results['accuracy']:.4f}")
+        if _need_features:
+            print(f"\n[{name}] Extracting features ...")
+            lp = LinearProbeEvaluator(
+                pretrained_model=lejepa,
+                num_classes=num_classes,
+                embed_dim=embed_dim,
+            )
+            train_feats, train_labels = lp.extract_features(train_loader)
+            test_feats, test_labels = lp.extract_features(test_loader)
+            print(f"  Train features: {train_feats.shape}")
+            print(f"  Test  features: {test_feats.shape}")
 
-        # Few-shot
-        print(f"\n[{name}] Few-Shot ...")
-        fs = FewShotEvaluator(pretrained_model=lejepa)
-        fs_results = fs.evaluate_data_efficiency(
-            train_feats, train_labels,
-            test_feats, test_labels,
-            fractions=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
-        )
-
-        # N-Shot Evaluation for 3D slice datasets
-        print(f"\n[{name}] N-Shot Classification (5/10/20-shot) ...")
-        n_shot_results = {}
-        unique_classes = torch.unique(train_labels)
-        for n_shot in [5, 10, 20]:
-            support_idx = []
-            for cls in unique_classes:
-                cls_idx = (train_labels == cls).nonzero(as_tuple=True)[0]
-                if len(cls_idx) >= n_shot:
-                    perm = cls_idx[torch.randperm(len(cls_idx))[:n_shot]]
-                else:
-                    perm = cls_idx
-                support_idx.append(perm)
-            support_idx = torch.cat(support_idx)
-            support_feats = train_feats[support_idx]
-            support_labs = train_labels[support_idx]
-
-            from sklearn.neighbors import KNeighborsClassifier
-            from sklearn.metrics import accuracy_score
-            k = min(5, len(support_labs))
-            knn = KNeighborsClassifier(n_neighbors=max(1, k))
-            knn.fit(support_feats.numpy(), support_labs.numpy())
-            preds = knn.predict(test_feats.numpy())
-            acc = accuracy_score(test_labels.numpy(), preds)
-            n_shot_results[f"{n_shot}-shot"] = {
-                "accuracy": acc,
-                "num_support": len(support_labs),
+        # ── Step: Linear Probe ──
+        if "linear_probing" in _steps_needed:
+            print(f"\n[{name}] Linear Probing (slice-level) ...")
+            lp.train_probe(train_feats, train_labels)
+            lp_results = lp.evaluate(test_feats, test_labels)
+            print(f"  Linear Probe Accuracy: {lp_results['accuracy']:.4f}")
+            all_results[name]["linear_probing"] = {
+                "accuracy": lp_results["accuracy"],
+                "auc": lp_results.get("auc"),
             }
-            print(f"  {n_shot}-shot: Accuracy = {acc:.4f}")
+            _save_partial()
+            print(f"  [Saved linear_probing result]")
+        else:
+            print(f"\n[{name}] Linear Probing ... SKIPPED (already done)")
 
-        # Supervised Baseline for 3D
-        print(f"\n[{name}] Supervised Baseline (random init) ...")
-        baseline_model = LeJEPA(
-            image_size=image_size,
-            patch_size=patch_size,
-            embed_dim=embed_dim,
-            encoder_depth=encoder_depth,
-            predictor_depth=predictor_depth,
-        ).to(device)
-        baseline_model.eval()
-        baseline_lp = LinearProbeEvaluator(
-            pretrained_model=baseline_model,
-            num_classes=num_classes,
-            embed_dim=embed_dim,
-        )
-        bl_train_feats, bl_train_labels = baseline_lp.extract_features(train_loader)
-        bl_test_feats, bl_test_labels = baseline_lp.extract_features(test_loader)
-        baseline_lp.train_probe(bl_train_feats, bl_train_labels)
-        bl_results = baseline_lp.evaluate(bl_test_feats, bl_test_labels)
-        print(f"  Baseline Accuracy: {bl_results['accuracy']:.4f}")
-        print(f"  MedJEPA  Accuracy: {lp_results['accuracy']:.4f}")
-        del baseline_model, baseline_lp
-        del bl_train_feats, bl_test_feats, bl_train_labels, bl_test_labels
-        del train_feats, test_feats, train_labels, test_labels
+        # ── Step: Few-Shot ──
+        if "few_shot" in _steps_needed:
+            print(f"\n[{name}] Few-Shot ...")
+            fs = FewShotEvaluator(pretrained_model=lejepa)
+            fs_results = fs.evaluate_data_efficiency(
+                train_feats, train_labels,
+                test_feats, test_labels,
+                fractions=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
+            )
+            all_results[name]["few_shot"] = fs_results
+            _save_partial()
+            print(f"  [Saved few_shot result]")
+        else:
+            print(f"\n[{name}] Few-Shot ... SKIPPED (already done)")
+
+        # ── Step: N-Shot Evaluation ──
+        if "n_shot" in _steps_needed:
+            print(f"\n[{name}] N-Shot Classification (5/10/20-shot) ...")
+            n_shot_results = {}
+            unique_classes = torch.unique(train_labels)
+            for n_shot in [5, 10, 20]:
+                support_idx = []
+                for cls in unique_classes:
+                    cls_idx = (train_labels == cls).nonzero(as_tuple=True)[0]
+                    if len(cls_idx) >= n_shot:
+                        perm = cls_idx[torch.randperm(len(cls_idx))[:n_shot]]
+                    else:
+                        perm = cls_idx
+                    support_idx.append(perm)
+                support_idx = torch.cat(support_idx)
+                support_feats = train_feats[support_idx]
+                support_labs = train_labels[support_idx]
+
+                from sklearn.neighbors import KNeighborsClassifier
+                from sklearn.metrics import accuracy_score
+                k = min(5, len(support_labs))
+                knn = KNeighborsClassifier(n_neighbors=max(1, k))
+                knn.fit(support_feats.numpy(), support_labs.numpy())
+                preds = knn.predict(test_feats.numpy())
+                acc = accuracy_score(test_labels.numpy(), preds)
+                n_shot_results[f"{n_shot}-shot"] = {
+                    "accuracy": acc,
+                    "num_support": len(support_labs),
+                }
+                print(f"  {n_shot}-shot: Accuracy = {acc:.4f}")
+            all_results[name]["n_shot"] = n_shot_results
+            _save_partial()
+            print(f"  [Saved n_shot result]")
+        else:
+            print(f"\n[{name}] N-Shot ... SKIPPED (already done)")
+
+        # ── Step: Supervised Baseline ──
+        if "supervised_baseline" in _steps_needed:
+            print(f"\n[{name}] Supervised Baseline (random init) ...")
+            baseline_model = LeJEPA(
+                image_size=image_size,
+                patch_size=patch_size,
+                embed_dim=embed_dim,
+                encoder_depth=encoder_depth,
+                predictor_depth=predictor_depth,
+            ).to(device)
+            baseline_model.eval()
+            baseline_lp = LinearProbeEvaluator(
+                pretrained_model=baseline_model,
+                num_classes=num_classes,
+                embed_dim=embed_dim,
+            )
+            bl_train_feats, bl_train_labels = baseline_lp.extract_features(train_loader)
+            bl_test_feats, bl_test_labels = baseline_lp.extract_features(test_loader)
+            baseline_lp.train_probe(bl_train_feats, bl_train_labels)
+            bl_results = baseline_lp.evaluate(bl_test_feats, bl_test_labels)
+            print(f"  Baseline Accuracy: {bl_results['accuracy']:.4f}")
+            if lp_results.get('accuracy') is not None:
+                print(f"  MedJEPA  Accuracy: {lp_results['accuracy']:.4f}")
+            del baseline_model, baseline_lp
+            del bl_train_feats, bl_test_feats, bl_train_labels, bl_test_labels
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            all_results[name]["supervised_baseline"] = {
+                "accuracy": bl_results["accuracy"],
+                "auc": bl_results.get("auc"),
+            }
+            _save_partial()
+            print(f"  [Saved supervised_baseline result]")
+        else:
+            print(f"\n[{name}] Supervised Baseline ... SKIPPED (already done)")
+
+        # Cleanup
+        try:
+            del train_feats, test_feats, train_labels, test_labels
+        except NameError:
+            pass
         del train_loader, test_loader, train_ds, test_ds
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-        all_results[name] = {
-            "type": "3d_as_2d_slices",
-            "description": cfg["description"],
-            "num_slices": len(ds),
-            "num_classes": num_classes,
-            "linear_probing": {
-                "accuracy": lp_results["accuracy"],
-                "auc": lp_results.get("auc"),
-            },
-            "few_shot": fs_results,
-            "n_shot": n_shot_results,
-            "supervised_baseline": {
-                "accuracy": bl_results["accuracy"],
-                "auc": bl_results.get("auc"),
-            },
-        }
-
-        # Save partial results after each 3D dataset (crash-safe)
-        _partial_dir = Path(args.results_dir)
-        _partial_dir.mkdir(parents=True, exist_ok=True)
-        _partial_path = _partial_dir / "evaluation_results_partial.json"
-        with open(_partial_path, "w") as _pf:
-            json.dump(all_results, _pf, indent=2, default=str)
-        print(f"  [Saved partial results to {_partial_path}]")
 
     # -- Segmentation evaluation (Dice Score on BraTS 2D slices via LeJEPA) --
     banner("Segmentation Evaluation (Dice Score)")
     brats_cfg = DATASETS_3D.get("brats")
     brats_data_exists = brats_cfg and check_dataset_exists(brats_cfg)
 
-    if brats_data_exists:
+    if _step_done("brats_segmentation", "mean_dice"):
+        print("  BraTS segmentation already done, skipping.")
+    elif brats_data_exists:
         try:
             from medjepa.data.datasets import NIfTISliceDataset
             import nibabel as nib
@@ -1858,6 +1956,8 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                     "per_class_dice": dice_results["per_class_dice"],
                     "num_test_slices": dice_results["num_samples"],
                 }
+                _save_partial()
+                print(f"  [Saved brats_segmentation result]")
             else:
                 print("  No paired seg slices found; skipping Dice eval.")
 
@@ -1875,6 +1975,10 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             continue
 
         task_name = deca_cfg["task_name"]
+        _deca_seg_key = f"{deca_key}_segmentation"
+        if _step_done(_deca_seg_key, "mean_dice"):
+            print(f"  SKIP {task_name} segmentation: already done")
+            continue
         banner(f"Segmentation Evaluation -- Decathlon {task_name}")
         try:
             import nibabel as nib
@@ -1927,6 +2031,8 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                     "per_class_dice": deca_dice["per_class_dice"],
                     "num_test_slices": deca_dice["num_samples"],
                 }
+                _save_partial()
+                print(f"  [Saved {_deca_seg_key} result]")
             else:
                 print(f"  No paired slices for {task_name}; skipping.")
 
@@ -2053,6 +2159,8 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             print(f"  Domain invariance test failed: {e}")
 
         all_results["cross_institutional"] = cross_results
+        _save_partial()
+        print(f"  [Saved cross_institutional results]")
     else:
         print("  Need >= 2 datasets for cross-institutional validation. Skipping.")
 

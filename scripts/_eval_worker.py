@@ -134,6 +134,7 @@ def run_fine_tuning(cfg):
     max_samples = cfg.get("max_samples")
     multi_label = cfg.get("multi_label", False)
     result_path = cfg.get("_result_path")  # early-write path
+    ft_epochs = cfg.get("ft_epochs", 10)
     ds_name = cfg["name"]
     ds_cfg = cfg["dataset_cfg"]
 
@@ -184,7 +185,7 @@ def run_fine_tuning(cfg):
         pretrained_model=ft_model,
         num_classes=num_classes,
         embed_dim=embed_dim,
-        num_epochs=20,
+        num_epochs=ft_epochs,
         multi_label=multi_label,
     )
 
