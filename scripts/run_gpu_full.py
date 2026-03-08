@@ -315,6 +315,10 @@ def parse_args():
     p.add_argument("--predictor_depth", type=int, default=None)
     p.add_argument("--mask_ratio", type=float, default=None)
     p.add_argument("--lambda_reg", type=float, default=None)
+    p.add_argument("--ema_momentum", type=float, default=None,
+                   help="EMA target encoder start momentum (default: 0.996)")
+    p.add_argument("--ema_momentum_end", type=float, default=None,
+                   help="EMA target encoder end momentum (default: 0.999)")
     # V-JEPA 3D
     p.add_argument("--volume_size", type=int, nargs=3, default=None,
                    help="3D volume size for V-JEPA (D H W)")
@@ -391,6 +395,8 @@ def parse_args():
             "batch_size": "batch_size", "num_epochs": "epochs",
             "learning_rate": "lr", "warmup_epochs": "warmup_epochs",
             "lambda_reg": "lambda_reg",
+            "ema_momentum": "ema_momentum",
+            "ema_momentum_end": "ema_momentum_end",
         },
         "data": {"num_workers": "num_workers"},
         "logging": {
@@ -411,6 +417,7 @@ def parse_args():
         "lambda_reg": 1.0, "volume_size": [128, 128, 64],
         "vjepa_epochs": 50, "vjepa_batch_size": 4,
         "epochs": 100, "batch_size": 256, "lr": 3e-4,
+        "ema_momentum": 0.996, "ema_momentum_end": 0.999,
         "warmup_epochs": 10, "num_workers": 8,
         "checkpoint_dir": "checkpoints", "results_dir": "results",
         "log_every": 10, "save_every": 5,
@@ -888,7 +895,7 @@ def run_lejepa_pretraining(args):
         split_encoding=_split_encoding,
         gradient_checkpointing=_grad_ckpt,
         use_ema=True,
-        ema_momentum=0.999,
+        ema_momentum=args.ema_momentum,
         augmentation=aug,
     )
     total_params = sum(p.numel() for p in model.parameters())
@@ -920,7 +927,8 @@ def run_lejepa_pretraining(args):
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "compile_model": True,
         "use_prefetcher": not getattr(args, "no_prefetcher", False),
-        "ema_momentum": 0.999,  # high momentum → target encoder retains ~24% per epoch → stable targets
+        "ema_momentum": args.ema_momentum,
+        "ema_momentum_end": args.ema_momentum_end,
     }
 
     # Check for existing checkpoint to resume from
