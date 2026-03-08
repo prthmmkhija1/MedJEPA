@@ -1458,10 +1458,23 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             print(f"\n[{name}] Linear Probing ... SKIPPED (already done)")
 
         # For multi-label datasets (ChestXray14), KNN-based evaluators
-        # need single integer labels.  Convert multi-hot → argmax.
+        # need single integer labels.  Convert multi-hot → dominant label.
+        # IMPORTANT: plain argmax maps all-zero vectors ("No Finding") to
+        # class 0, corrupting KNN evaluations.  Instead assign "No Finding"
+        # as a separate class (index = num_classes).
         if _need_features and _multi_label and train_labels.dim() == 2:
-            _train_labels_1d = train_labels.argmax(dim=1)
-            _test_labels_1d = test_labels.argmax(dim=1)
+            _has_pos_train = train_labels.sum(dim=1) > 0
+            _train_labels_1d = torch.where(
+                _has_pos_train,
+                train_labels.argmax(dim=1),
+                torch.full((train_labels.shape[0],), num_classes, dtype=torch.long),
+            )
+            _has_pos_test = test_labels.sum(dim=1) > 0
+            _test_labels_1d = torch.where(
+                _has_pos_test,
+                test_labels.argmax(dim=1),
+                torch.full((test_labels.shape[0],), num_classes, dtype=torch.long),
+            )
         elif _need_features:
             _train_labels_1d = train_labels
             _test_labels_1d = test_labels
@@ -1552,9 +1565,14 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             baseline_results = baseline_lp.evaluate(baseline_test_feats, baseline_test_labels)
             print(f"  Baseline Accuracy: {baseline_results['accuracy']:.4f}")
             print(f"  MedJEPA  Accuracy: {lp_results.get('accuracy', 'N/A')}")
+            # For multi-label, AUC is the reliable metric (accuracy is inflated
+            # by the majority of true-negative labels).  Show both comparisons.
+            if _multi_label and lp_results.get('auc') is not None and baseline_results.get('auc') is not None:
+                improvement_auc = lp_results['auc'] - baseline_results['auc']
+                print(f"  Improvement (AUC): {improvement_auc:+.4f}  [primary metric for multi-label]")
             if lp_results.get('accuracy') is not None:
                 improvement = lp_results['accuracy'] - baseline_results['accuracy']
-                print(f"  Improvement:       {improvement:+.4f}")
+                print(f"  Improvement (Acc): {improvement:+.4f}{'  ⚠ inflated for multi-label' if _multi_label else ''}")
 
             del baseline_model, baseline_lp
             del baseline_train_feats, baseline_test_feats

@@ -36,6 +36,8 @@ class MedJEPAAugmentation(nn.Module):
         gaussian_blur_p: float = 0.3,
         blur_kernel_size: int = 5,
         random_erasing_p: float = 0.0,
+        random_rotation_p: float = 0.5,
+        rotation_degrees: float = 15.0,
     ):
         super().__init__()
         self.horizontal_flip_p = horizontal_flip_p
@@ -46,6 +48,8 @@ class MedJEPAAugmentation(nn.Module):
         self.gaussian_blur_p = gaussian_blur_p
         self.blur_kernel_size = blur_kernel_size
         self.random_erasing_p = random_erasing_p
+        self.random_rotation_p = random_rotation_p
+        self.rotation_degrees = rotation_degrees
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -76,6 +80,12 @@ class MedJEPAAugmentation(nn.Module):
                 flip_mask = torch.rand(B, device=x.device) < self.horizontal_flip_p
                 if flip_mask.any():
                     x[flip_mask] = x[flip_mask].flip(-1)
+
+            # --- Random rotation (small angles for anatomical plausibility) ---
+            if self.random_rotation_p > 0:
+                rot_mask = torch.rand(B, device=x.device) < self.random_rotation_p
+                if rot_mask.any():
+                    x[rot_mask] = self._random_rotate(x[rot_mask])
 
             # --- Color jitter (brightness + contrast + saturation) ---
             if self.color_jitter_p > 0:
@@ -126,4 +136,22 @@ class MedJEPAAugmentation(nn.Module):
         pad = k // 2
         x = torch.nn.functional.conv2d(x, kernel_h, padding=(0, pad), groups=3)
         x = torch.nn.functional.conv2d(x, kernel_v, padding=(pad, 0), groups=3)
+        return x
+
+    def _random_rotate(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply random rotation (±rotation_degrees) using affine_grid + grid_sample."""
+        B = x.shape[0]
+        deg = self.rotation_degrees
+        angles = (torch.rand(B, device=x.device) * 2 - 1) * deg  # uniform in [-deg, deg]
+        rad = angles * (torch.pi / 180.0)
+        cos_a = torch.cos(rad)
+        sin_a = torch.sin(rad)
+        # Build 2×3 affine matrices for rotation around centre
+        theta = torch.zeros(B, 2, 3, device=x.device)
+        theta[:, 0, 0] = cos_a
+        theta[:, 0, 1] = -sin_a
+        theta[:, 1, 0] = sin_a
+        theta[:, 1, 1] = cos_a
+        grid = torch.nn.functional.affine_grid(theta, x.shape, align_corners=False)
+        x = torch.nn.functional.grid_sample(x, grid, align_corners=False, padding_mode='reflection')
         return x

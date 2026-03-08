@@ -19,7 +19,7 @@ model:
 
 # --- Masking ---
 masking:
-  mask_ratio: 0.75 # Hide 75% of patches
+  mask_ratio: 0.65 # Hide 65% of patches (medical images need more context)
   mask_type: "block" # "block" or "random"
   num_target_blocks: 4
 
@@ -31,6 +31,8 @@ training:
   weight_decay: 0.05 # Prevents overfitting
   warmup_epochs: 10 # Slowly increase learning rate at start
   lambda_reg: 1.0 # SIGReg regularization strength
+  ema_momentum: 0.996 # EMA target encoder start momentum
+  ema_momentum_end: 0.999 # EMA end momentum (never 1.0 — target must keep tracking)
 
 # --- V-JEPA (3D Volumes) ---
 vjepa:

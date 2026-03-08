@@ -407,7 +407,7 @@ class MedJEPATrainer:
         # Higher momentum later means the target encoder changes more slowly as
         # training progresses, producing increasingly stable targets.
         self._ema_start = config.get("ema_momentum", 0.996)
-        self._ema_end = config.get("ema_momentum_end", 1.0)
+        self._ema_end = config.get("ema_momentum_end", 0.999)
         self._total_ema_steps = (
             config.get("num_epochs", 100)
             * max(len(train_dataset) // max(config.get("batch_size", 32), 1), 1)

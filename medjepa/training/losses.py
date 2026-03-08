@@ -62,6 +62,10 @@ class SIGRegLoss(nn.Module):
         # the encoder's tendency to produce image-independent embeddings.
         lambda_cov: float = 0.04,
         # Weight for the off-diagonal covariance term.
+        normalize_targets: bool = True,
+        # LayerNorm targets before MSE: stabilizes the prediction loss scale
+        # across training, preventing early-stage scale mismatch from
+        # drowning out semantic gradients.
     ):
         super().__init__()
         self.lambda_reg = lambda_reg
@@ -69,6 +73,13 @@ class SIGRegLoss(nn.Module):
         self.variance_target = variance_target
         self.lambda_var = lambda_var
         self.lambda_cov = lambda_cov
+        self.normalize_targets = normalize_targets
+
+        # Target normalizer (applied before MSE)
+        if normalize_targets:
+            self._target_norm = nn.LayerNorm(768, elementwise_affine=False)
+            self._pred_norm = nn.LayerNorm(768, elementwise_affine=False)
+            self._target_norm_initialized = False
 
         # Random projection matrix — registered as a buffer so it moves
         # with .to(device) and doesn't trigger CUDA-graph recompilation.
@@ -105,19 +116,32 @@ class SIGRegLoss(nn.Module):
     ) -> torch.Tensor:
         """
         How different are the predictions from the actual embeddings?
-        Uses MSE on raw (un-normalised) embeddings — this is the formulation
-        used in the original I-JEPA paper and provides meaningful gradients
-        throughout training.  Smooth-L1 on L2-normalised vectors compresses
-        the loss to ~0.0003 within a few epochs, starving the model of
-        learning signal.
+        Uses MSE on (optionally LayerNorm-normalized) embeddings.
+
+        When normalize_targets=True, both predicted and target are
+        independently LayerNorm-normalized before MSE.  This removes
+        scale differences between the predictor output and the EMA
+        target, ensuring the loss purely measures *direction* alignment
+        — analogous to cosine similarity but with MSE gradients.
 
         Args:
             predicted: What the predictor thinks the target embeddings are
             target: What the target embeddings actually are (from the encoder)
         """
-        # Cast to float32 — bfloat16 mixed-precision can squash small
-        # differences to zero, starving the encoder of gradient signal.
-        loss = F.mse_loss(predicted.float(), target.float())
+        pred = predicted.float()
+        tgt = target.float()
+
+        if self.normalize_targets:
+            D = tgt.shape[-1]
+            # Lazily (re-)initialize norms if embed_dim changed
+            if not self._target_norm_initialized or self._target_norm.normalized_shape[0] != D:
+                self._target_norm = nn.LayerNorm(D, elementwise_affine=False).to(tgt.device)
+                self._pred_norm = nn.LayerNorm(D, elementwise_affine=False).to(pred.device)
+                self._target_norm_initialized = True
+            tgt = self._target_norm(tgt)
+            pred = self._pred_norm(pred)
+
+        loss = F.mse_loss(pred, tgt)
         return loss
 
     def variance_loss(

@@ -135,7 +135,7 @@ class FineTuneEvaluator:
             criterion = nn.CrossEntropyLoss()
 
         history = {"train_loss": [], "val_acc": []}
-        _log_every = 100  # print step-level progress every N steps
+        _log_every = 25  # print step-level progress every N steps
 
         for epoch in range(self.num_epochs):
             # --- Train ---
@@ -144,6 +144,8 @@ class FineTuneEvaluator:
             epoch_loss = 0.0
             n_batches = 0
             total_steps = len(train_loader)
+            print(f"  FT Epoch {epoch+1}/{self.num_epochs} | "
+                  f"{total_steps} steps ...", flush=True)
 
             optimizer.zero_grad()
             for step, batch in enumerate(train_loader):
