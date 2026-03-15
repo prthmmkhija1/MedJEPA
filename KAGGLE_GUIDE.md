@@ -87,14 +87,26 @@ This session downloads datasets and trains LeJEPA from scratch.
 
 **Cell 1 — Clone and install**
 
+> **Why `/kaggle/working/`?** Kaggle has two disk areas:
+> - Root filesystem (`/`) — only ~5 GB, fills up fast, causes "no space left on device"
+> - `/kaggle/working/` — ~70 GB output disk, this is where you must work
+>
+> Always clone and install here. The `GIT_TMPDIR` line tells git to write
+> temp files to the big disk too (otherwise it uses `/tmp` on the small disk).
+
 ```python
 # ============================================================
 # CELL 1: Get the code from GitHub and install it
 # ============================================================
-!git clone https://github.com/prthmmkhija1/MedJEPA.git
-%cd MedJEPA
-!pip install -e ".[medical]" -q
-!pip install gdown -q
+# IMPORTANT: Use /kaggle/working/ (70GB) — NOT the root filesystem (5GB)
+import os
+os.makedirs('/kaggle/working/tmp', exist_ok=True)
+os.environ['GIT_TMPDIR'] = '/kaggle/working/tmp'   # git temp → big disk
+
+!git clone --depth 1 https://github.com/prthmmkhija1/MedJEPA.git /kaggle/working/MedJEPA
+%cd /kaggle/working/MedJEPA
+!pip install -e ".[medical]" -q --cache-dir /kaggle/working/pip_cache
+!pip install gdown -q --cache-dir /kaggle/working/pip_cache
 print("Setup done!")
 ```
 
@@ -259,10 +271,15 @@ fixed kNN code.
 # ============================================================
 # CELL 1: Clone and install (same as Session 1)
 # ============================================================
-!git clone https://github.com/prthmmkhija1/MedJEPA.git
-%cd MedJEPA
-!pip install -e ".[medical]" -q
-!pip install gdown -q
+# IMPORTANT: Use /kaggle/working/ (70GB) — NOT the root filesystem (5GB)
+import os
+os.makedirs('/kaggle/working/tmp', exist_ok=True)
+os.environ['GIT_TMPDIR'] = '/kaggle/working/tmp'   # git temp → big disk
+
+!git clone --depth 1 https://github.com/prthmmkhija1/MedJEPA.git /kaggle/working/MedJEPA
+%cd /kaggle/working/MedJEPA
+!pip install -e ".[medical]" -q --cache-dir /kaggle/working/pip_cache
+!pip install gdown -q --cache-dir /kaggle/working/pip_cache
 print("Setup done!")
 ```
 
@@ -613,6 +630,28 @@ git push
 ---
 
 ## Troubleshooting
+
+### "No space left on device" during git clone / pip install
+
+This means you accidentally cloned into the root filesystem (`/`, ~5 GB).
+Fix: always clone into `/kaggle/working/` and set `GIT_TMPDIR`:
+
+```python
+import os
+os.makedirs('/kaggle/working/tmp', exist_ok=True)
+os.environ['GIT_TMPDIR'] = '/kaggle/working/tmp'
+
+!git clone --depth 1 https://github.com/prthmmkhija1/MedJEPA.git /kaggle/working/MedJEPA
+%cd /kaggle/working/MedJEPA
+```
+
+Also free space by clearing the pip cache if needed:
+
+```python
+!pip cache purge
+```
+
+---
 
 ### "CUDA out of memory" during training (Session 1)
 
