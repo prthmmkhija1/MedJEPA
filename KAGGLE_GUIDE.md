@@ -89,7 +89,7 @@ This session downloads datasets and trains LeJEPA from scratch.
 
 > **Why `/kaggle/working/`?** Kaggle has two disk areas:
 > - Root filesystem (`/`) — only ~5 GB, fills up fast, causes "no space left on device"
-> - `/kaggle/working/` — ~70 GB output disk, this is where you must work
+> - `/kaggle/working/` — ~20 GB on free tier, this is where you must work
 >
 > Always clone and install here. The `GIT_TMPDIR` line tells git to write
 > temp files to the big disk too (otherwise it uses `/tmp` on the small disk).
@@ -141,21 +141,21 @@ print("Setup done!")
 
 **Cell 2 — Download datasets**
 
+> **Disk budget (20 GB total):**
+> Code + packages ≈ 4 GB, HAM10000 ≈ 3 GB → leaves ~13 GB free for training.
+> PCam is 8 GB and APTOS zip is 8 GB — both are too large for the remaining space.
+> `--small` downloads HAM10000 only, which is enough for a full GSoC demo
+> (10,015 images, 7 classes, all evaluation steps work).
+
 ```python
 # ============================================================
-# CELL 2: Download datasets using Kaggle API
+# CELL 2: Download dataset — HAM10000 only (fits in 20 GB disk)
 # ============================================================
-# ChestXray14 is ~42 GB — we skip it to save disk space.
-# HAM10000 + APTOS + PCam + BraTS (~15 GB total) is enough
-# for strong pretraining results.
-#
-# Takes ~20-30 min.
-
-!python scripts/download_data.py  # skips ChestXray14 by default
+!python scripts/download_data.py --small
 
 # Quick check: what downloaded?
 import os
-data_dir = 'data/raw'
+data_dir = '/kaggle/working/MedJEPA/data/raw'
 if os.path.exists(data_dir):
     print("\nDownloaded datasets:")
     for item in sorted(os.listdir(data_dir)):
@@ -163,11 +163,18 @@ if os.path.exists(data_dir):
         if os.path.isdir(path):
             n_files = sum(len(f) for _, _, f in os.walk(path))
             print(f"  {item:30s}  ({n_files:,} files)")
+
+# Show remaining disk space
+import subprocess
+subprocess.run(['df', '-h', '/kaggle/working'], check=False)
 ```
 
-> **Disk space warning:** Kaggle gives ~70 GB. If ChestXray14 fails, don't
-> worry — the model will train on the other datasets. HAM10000 + APTOS +
-> PCam + BraTS is enough for good results.
+> Want more datasets? Run individual downloads in separate cells:
+> ```python
+> !python scripts/download_data.py --only aptos   # +3 GB
+> !python scripts/download_data.py --only brats   # +2-5 GB
+> ```
+> Check `df -h /kaggle/working` after each one to make sure you don't fill the disk.
 
 ---
 
@@ -369,12 +376,12 @@ else:
 
 ```python
 # ============================================================
-# CELL 3: Download datasets (same as Session 1)
+# CELL 3: Download HAM10000 only (fits in 20 GB disk)
 # ============================================================
-!python scripts/download_data.py
+!python scripts/download_data.py --small
 
-import os
-data_dir = 'data/raw'
+import os, subprocess
+data_dir = '/kaggle/working/MedJEPA/data/raw'
 if os.path.exists(data_dir):
     print("\nAvailable datasets:")
     for item in sorted(os.listdir(data_dir)):
@@ -382,6 +389,7 @@ if os.path.exists(data_dir):
         if os.path.isdir(path):
             n_files = sum(len(f) for _, _, f in os.walk(path))
             print(f"  {item:30s}  ({n_files:,} files)")
+subprocess.run(['df', '-h', '/kaggle/working'], check=False)
 ```
 
 ---

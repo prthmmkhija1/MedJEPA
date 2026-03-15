@@ -15,8 +15,9 @@ Datasets (3D):
   Decathlon      — 10 segmentation tasks (multi-organ CT/MRI)
 
 Usage:
-    python scripts/download_data.py            # download all (except chestxray14)
+    python scripts/download_data.py --small     # HAM10000 only (~3 GB, Kaggle-safe)
     python scripts/download_data.py --only ham  # download just one
+    python scripts/download_data.py             # all except ChestXray14
     python scripts/download_data.py --all       # include ChestXray14 (~42 GB)
 
 Kaggle API setup (one-time, not needed inside Kaggle notebooks):
@@ -380,6 +381,10 @@ Available datasets:
         "--all", action="store_true",
         help="Include ChestXray14 (~42 GB). Without this flag it is skipped.",
     )
+    parser.add_argument(
+        "--small", action="store_true",
+        help="Kaggle-safe preset: HAM10000 only (~3 GB). Fits in 20 GB disk.",
+    )
     args = parser.parse_args()
 
     check_kaggle()
@@ -400,7 +405,11 @@ Available datasets:
         "chestxray": download_chestxray14,
     }
 
-    if args.only:
+    if args.small:
+        # Only HAM10000 — safe for Kaggle's 20 GB disk after code+packages take ~4 GB
+        print("NOTE: --small mode: downloading HAM10000 only (~3 GB).")
+        download_ham10000()
+    elif args.only:
         key = args.only.lower()
         if key not in downloaders_all:
             print(f"Unknown dataset: {key}")
