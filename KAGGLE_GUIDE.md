@@ -99,7 +99,20 @@ This session downloads datasets and trains LeJEPA from scratch.
 # CELL 1: Get the code from GitHub and install it
 # ============================================================
 # IMPORTANT: Use /kaggle/working/ (70GB) — NOT the root filesystem (5GB)
-import os
+import os, shutil, subprocess
+
+# ── show disk usage so you can diagnose if something is wrong ────────
+subprocess.run(['df', '-h', '/kaggle/working'], check=False)
+
+# ── remove stale artifacts from any previous run ─────────────────────
+# This is safe: data/ is re-downloaded in Cell 2 anyway
+for stale in ['/kaggle/working/MedJEPA',
+              '/kaggle/working/pip_cache',
+              '/kaggle/working/tmp']:
+    if os.path.exists(stale):
+        print(f"Cleaning up {stale} ...")
+        shutil.rmtree(stale, ignore_errors=True)
+
 os.makedirs('/kaggle/working/tmp', exist_ok=True)
 os.environ['GIT_TMPDIR'] = '/kaggle/working/tmp'   # git temp → big disk
 
@@ -116,16 +129,15 @@ print("Setup done!")
 
 ```python
 # ============================================================
-# CELL 2: Download all 6 datasets using Kaggle API
+# CELL 2: Download datasets using Kaggle API
 # ============================================================
-# Kaggle notebooks have the API key pre-configured, so this
-# "just works" without any credential setup.
+# ChestXray14 is ~42 GB — we skip it to save disk space.
+# HAM10000 + APTOS + PCam + BraTS (~15 GB total) is enough
+# for strong pretraining results.
 #
-# Takes ~30-45 min. Some datasets are large (PCam ~7GB).
-# ChestXray14 is ~42GB — if it fails due to disk space, that's
-# OK, the training script will skip it and use the others.
+# Takes ~20-30 min.
 
-!python scripts/download_data.py
+!python scripts/download_data.py  # skips ChestXray14 by default
 
 # Quick check: what downloaded?
 import os
@@ -272,7 +284,17 @@ fixed kNN code.
 # CELL 1: Clone and install (same as Session 1)
 # ============================================================
 # IMPORTANT: Use /kaggle/working/ (70GB) — NOT the root filesystem (5GB)
-import os
+import os, shutil, subprocess
+
+subprocess.run(['df', '-h', '/kaggle/working'], check=False)
+
+for stale in ['/kaggle/working/MedJEPA',
+              '/kaggle/working/pip_cache',
+              '/kaggle/working/tmp']:
+    if os.path.exists(stale):
+        print(f"Cleaning up {stale} ...")
+        shutil.rmtree(stale, ignore_errors=True)
+
 os.makedirs('/kaggle/working/tmp', exist_ok=True)
 os.environ['GIT_TMPDIR'] = '/kaggle/working/tmp'   # git temp → big disk
 
@@ -633,23 +655,28 @@ git push
 
 ### "No space left on device" during git clone / pip install
 
-This means you accidentally cloned into the root filesystem (`/`, ~5 GB).
-Fix: always clone into `/kaggle/working/` and set `GIT_TMPDIR`:
+`/kaggle/working/` (70 GB) is full — usually from a previous run's datasets
+or pip cache. Fix: clean up stale files before cloning.
 
 ```python
-import os
-os.makedirs('/kaggle/working/tmp', exist_ok=True)
-os.environ['GIT_TMPDIR'] = '/kaggle/working/tmp'
+import shutil, subprocess
 
-!git clone --depth 1 https://github.com/prthmmkhija1/MedJEPA.git /kaggle/working/MedJEPA
-%cd /kaggle/working/MedJEPA
+# See what's eating space
+subprocess.run(['df', '-h', '/kaggle/working'], check=False)
+subprocess.run(['du', '-sh', '/kaggle/working/*'], shell=True, check=False)
+
+# Remove stale artifacts (datasets will be re-downloaded in Cell 2)
+for stale in ['/kaggle/working/MedJEPA',
+              '/kaggle/working/pip_cache',
+              '/kaggle/working/tmp']:
+    shutil.rmtree(stale, ignore_errors=True)
+    print(f"Removed {stale}")
+
+# If the datasets directory itself is huge, clear it too
+shutil.rmtree('/kaggle/working/MedJEPA/data', ignore_errors=True)
 ```
 
-Also free space by clearing the pip cache if needed:
-
-```python
-!pip cache purge
-```
+Then re-run Cell 1.
 
 ---
 
