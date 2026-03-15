@@ -45,6 +45,10 @@ Thumbs.db
 Desktop.ini
 ehthumbs.db
 
+# --- Node.js (accidental) ---
+package-lock.json
+node_modules/
+
 # --- IDE ---
 .vscode/
 .idea/

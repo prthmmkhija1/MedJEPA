@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "medjepa"
+version = "0.1.0"
+description = "Self-Supervised Medical Image Representation Learning with JEPA"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "Pratham Khija"}]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "scikit-learn",
+    "nibabel",
+    "albumentations",
+    "opencv-python",
+    "Pillow",
+    "tqdm",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+medical = ["pydicom", "monai", "SimpleITK"]
+wandb = ["wandb", "tensorboard"]
+dev = ["pytest", "black", "flake8"]
+all = ["medjepa[medical,wandb,dev]"]
+
+[project.urls]
+Homepage = "https://github.com/prthmmkhija1/MedJEPA"
+Repository = "https://github.com/prthmmkhija1/MedJEPA"
+Issues = "https://github.com/prthmmkhija1/MedJEPA/issues"
+
+[project.scripts]
+medjepa-pretrain = "scripts.pretrain:main"
+medjepa-evaluate = "scripts.evaluate:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 120
+
+[tool.flake8]
+max-line-length = 120
+select = ["E9", "F63", "F7", "F82"]

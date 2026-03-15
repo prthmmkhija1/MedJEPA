@@ -6,10 +6,16 @@ Handles different formats and normalizes everything to a consistent format.
 import numpy as np
 import torch
 from pathlib import Path
-import pydicom
 from typing import Tuple, Optional, Dict
 import os
 import contextlib
+
+# pydicom is only needed for DICOM files — make it optional so the rest
+# of the package works without it (e.g. in CI or when using only PNG/NIfTI).
+try:
+    import pydicom
+except ImportError:
+    pydicom = None
 
 # Try to import fast cv2 loader; fall back to PIL
 try:
@@ -129,6 +135,11 @@ class MedicalImagePreprocessor:
 
     def _load_dicom(self, path: Path) -> np.ndarray:
         """Load a DICOM file and extract the pixel data."""
+        if pydicom is None:
+            raise ImportError(
+                "pydicom is required to load DICOM files. "
+                "Install it with: pip install pydicom"
+            )
         ds = pydicom.dcmread(str(path))
         pixel_array = ds.pixel_array.astype(np.float32)
         return pixel_array

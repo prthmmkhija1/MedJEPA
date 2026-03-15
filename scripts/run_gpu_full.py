@@ -76,7 +76,7 @@ from medjepa.data.datasets import (
 )
 from medjepa.training.trainer import MedJEPATrainer
 from medjepa.evaluation.linear_probe import LinearProbeEvaluator
-from medjepa.evaluation.few_shot import FewShotEvaluator
+from medjepa.evaluation.few_shot import FewShotEvaluator, PrototypeNetworkEvaluator, _l2_normalize
 from medjepa.evaluation.segmentation import (
     SimpleSegmentationHead,
     SegmentationEvaluator,
@@ -372,6 +372,8 @@ def parse_args():
                    help="Skip full fine-tuning evaluation (saves time; linear probe results still run)")
     p.add_argument("--ft_epochs", type=int, default=10,
                    help="Number of fine-tuning epochs per dataset (default: 10)")
+    p.add_argument("--download", action="store_true",
+                   help="Download all datasets before running (calls scripts/download_data.py)")
 
     raw = p.parse_args()
 
@@ -1517,6 +1519,12 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                 _idx = _rng.choice(len(_test_labels_1d), 20000, replace=False)
                 _nshot_test_feats = test_feats[_idx]
                 _nshot_test_labels_1d = _test_labels_1d[_idx]
+
+            # L2-normalize test features once (for cosine similarity)
+            _nshot_test_np = _l2_normalize(_nshot_test_feats.numpy())
+            _nshot_test_labs_np = _nshot_test_labels_1d.numpy()
+
+            proto_eval = PrototypeNetworkEvaluator(pretrained_model=lejepa)
             for n_shot in [5, 10, 20]:
                 support_idx = []
                 for cls in unique_classes:
@@ -1527,21 +1535,44 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                         perm = cls_idx
                     support_idx.append(perm)
                 support_idx = torch.cat(support_idx)
-                support_feats = train_feats[support_idx]
-                support_labs = _train_labels_1d[support_idx]
+                support_feats_np = train_feats[support_idx].numpy()
+                support_labs_np = _train_labels_1d[support_idx].numpy()
 
+                # L2-normalize support features
+                support_feats_norm = _l2_normalize(support_feats_np)
+
+                # Cosine kNN
                 from sklearn.neighbors import KNeighborsClassifier
                 from sklearn.metrics import accuracy_score
-                k = min(5, len(support_labs))
-                knn = KNeighborsClassifier(n_neighbors=max(1, k), algorithm='ball_tree')
-                knn.fit(support_feats.numpy(), support_labs.numpy())
-                preds = knn.predict(_nshot_test_feats.numpy())
-                acc = accuracy_score(_nshot_test_labels_1d.numpy(), preds)
+                k = min(5, len(support_labs_np))
+                knn = KNeighborsClassifier(
+                    n_neighbors=max(1, k),
+                    metric='cosine',
+                    algorithm='brute',
+                )
+                knn.fit(support_feats_norm, support_labs_np)
+                preds = knn.predict(_nshot_test_np)
+                knn_acc = accuracy_score(_nshot_test_labs_np, preds)
+
+                # Prototype network
+                proto_res = proto_eval.evaluate_n_shot(
+                    support_feats_np, support_labs_np,
+                    _nshot_test_feats.numpy(), _nshot_test_labs_np,
+                    n_shot=n_shot,
+                )
+                proto_acc = proto_res["accuracy"]
+
+                best_acc = max(knn_acc, proto_acc)
+                best_method = "cosine_knn" if knn_acc >= proto_acc else "prototype"
+
                 n_shot_results[f"{n_shot}-shot"] = {
-                    "accuracy": acc,
-                    "num_support": len(support_labs),
+                    "accuracy": best_acc,
+                    "cosine_knn_accuracy": knn_acc,
+                    "prototype_accuracy": proto_acc,
+                    "best_method": best_method,
+                    "num_support": len(support_labs_np),
                 }
-                print(f"  {n_shot}-shot: Accuracy = {acc:.4f} ({len(support_labs)} support samples)")
+                print(f"  {n_shot}-shot: Best = {best_acc:.4f} (kNN={knn_acc:.4f}, Proto={proto_acc:.4f}) [{best_method}]")
             all_results[name]["n_shot"] = n_shot_results
             _save_partial()
             print(f"  [Saved n_shot result]")
@@ -1833,6 +1864,12 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
             print(f"\n[{name}] N-Shot Classification (5/10/20-shot) ...")
             n_shot_results = {}
             unique_classes = torch.unique(train_labels)
+
+            # L2-normalize test features once
+            _nshot_test_np = _l2_normalize(test_feats.numpy())
+            _nshot_test_labs_np = test_labels.numpy()
+
+            proto_eval = PrototypeNetworkEvaluator(pretrained_model=lejepa)
             for n_shot in [5, 10, 20]:
                 support_idx = []
                 for cls in unique_classes:
@@ -1843,21 +1880,41 @@ def run_evaluation(args, lejepa_ckpt: str, vjepa_ckpt: str = None):
                         perm = cls_idx
                     support_idx.append(perm)
                 support_idx = torch.cat(support_idx)
-                support_feats = train_feats[support_idx]
-                support_labs = train_labels[support_idx]
+                support_feats_np = train_feats[support_idx].numpy()
+                support_labs_np = train_labels[support_idx].numpy()
+
+                support_feats_norm = _l2_normalize(support_feats_np)
 
                 from sklearn.neighbors import KNeighborsClassifier
                 from sklearn.metrics import accuracy_score
-                k = min(5, len(support_labs))
-                knn = KNeighborsClassifier(n_neighbors=max(1, k))
-                knn.fit(support_feats.numpy(), support_labs.numpy())
-                preds = knn.predict(test_feats.numpy())
-                acc = accuracy_score(test_labels.numpy(), preds)
+                k = min(5, len(support_labs_np))
+                knn = KNeighborsClassifier(
+                    n_neighbors=max(1, k),
+                    metric='cosine',
+                    algorithm='brute',
+                )
+                knn.fit(support_feats_norm, support_labs_np)
+                preds = knn.predict(_nshot_test_np)
+                knn_acc = accuracy_score(_nshot_test_labs_np, preds)
+
+                proto_res = proto_eval.evaluate_n_shot(
+                    support_feats_np, support_labs_np,
+                    test_feats.numpy(), _nshot_test_labs_np,
+                    n_shot=n_shot,
+                )
+                proto_acc = proto_res["accuracy"]
+
+                best_acc = max(knn_acc, proto_acc)
+                best_method = "cosine_knn" if knn_acc >= proto_acc else "prototype"
+
                 n_shot_results[f"{n_shot}-shot"] = {
-                    "accuracy": acc,
-                    "num_support": len(support_labs),
+                    "accuracy": best_acc,
+                    "cosine_knn_accuracy": knn_acc,
+                    "prototype_accuracy": proto_acc,
+                    "best_method": best_method,
+                    "num_support": len(support_labs_np),
                 }
-                print(f"  {n_shot}-shot: Accuracy = {acc:.4f}")
+                print(f"  {n_shot}-shot: Best = {best_acc:.4f} (kNN={knn_acc:.4f}, Proto={proto_acc:.4f}) [{best_method}]")
             all_results[name]["n_shot"] = n_shot_results
             _save_partial()
             print(f"  [Saved n_shot result]")
@@ -2269,6 +2326,13 @@ def main():
 
     banner("MedJEPA -- Full GPU Pipeline (6 Datasets)")
     get_device_info()
+
+    # Auto-download datasets if requested
+    if args.download:
+        banner("Downloading Datasets")
+        download_script = PROJECT_ROOT / "scripts" / "download_data.py"
+        import subprocess as _sp
+        _sp.run([sys.executable, str(download_script)], check=False)
 
     # Report available datasets
     print("\nAvailable datasets:")

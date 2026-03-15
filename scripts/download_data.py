@@ -242,6 +242,32 @@ def download_decathlon():
 
 
 # ══════════════════════════════════════════════════════
+# Additional 2D Datasets (planned for GSoC scale-up)
+# ══════════════════════════════════════════════════════
+
+def download_isic():
+    """ISIC 2019 — 25,331 dermoscopic images, 8 diagnostic categories."""
+    out = DATA_RAW / "isic2019"
+    out.mkdir(parents=True, exist_ok=True)
+    print("\n[7/8] Downloading ISIC 2019 (dermoscopy)...")
+    run(f"kaggle datasets download -d andrewmvd/isic-2019 -p {out} --unzip")
+    print(f"  Done -> {out}")
+
+
+def download_chexpert():
+    """CheXpert — 224,316 chest radiographs, 14 observations.
+    NOTE: Full CheXpert requires Stanford AIMI access. This downloads the
+    small demo version from Kaggle. For the full dataset, apply at
+    https://stanfordaimi.azurewebsites.net/datasets/8cbd9ed4-2eb9-4565-affc-111cf4f7ebe2
+    """
+    out = DATA_RAW / "chexpert"
+    out.mkdir(parents=True, exist_ok=True)
+    print("\n[8/8] Downloading CheXpert-small (chest X-ray)...")
+    run(f"kaggle datasets download -d ashery/chexpert -p {out} --unzip")
+    print(f"  Done -> {out}")
+
+
+# ══════════════════════════════════════════════════════
 # Setup & main
 # ══════════════════════════════════════════════════════
 
@@ -268,7 +294,7 @@ def main():
         "--only",
         type=str,
         default=None,
-        help="Download only this dataset: ham|aptos|pcam|chestxray|brats|decathlon",
+        help="Download only this dataset: ham|aptos|pcam|chestxray|brats|decathlon|isic|chexpert",
     )
     args = parser.parse_args()
 
@@ -281,6 +307,8 @@ def main():
         "chestxray": download_chestxray14,
         "brats":     download_brats,
         "decathlon": download_decathlon,
+        "isic":      download_isic,
+        "chexpert":  download_chexpert,
     }
 
     if args.only:

@@ -196,6 +196,30 @@ class TestFewShot:
         assert len(results) == 2
         assert "accuracy" in results[0]
 
+    def test_prototype_network(self):
+        from medjepa.evaluation.few_shot import PrototypeNetworkEvaluator
+
+        class MockModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dummy = torch.nn.Linear(1, 1)
+
+            def encode(self, x):
+                return torch.randn(x.shape[0], 64)
+
+        model = MockModel()
+        ev = PrototypeNetworkEvaluator(model)
+
+        support_f = np.random.randn(15, 64).astype(np.float32)
+        support_l = np.array([0]*5 + [1]*5 + [2]*5)
+        query_f = np.random.randn(10, 64).astype(np.float32)
+        query_l = np.array([0]*3 + [1]*4 + [2]*3)
+
+        result = ev.evaluate_n_shot(support_f, support_l, query_f, query_l, n_shot=5)
+        assert "accuracy" in result
+        assert result["method"] == "prototype_network"
+        assert 0.0 <= result["accuracy"] <= 1.0
+
 
 # ---------------------------------------------------------------------------
 # Segmentation Head
@@ -299,6 +323,7 @@ class TestImports:
             LinearProbe,
             LinearProbeEvaluator,
             FewShotEvaluator,
+            PrototypeNetworkEvaluator,
             SimpleSegmentationHead,
             dice_score,
         )

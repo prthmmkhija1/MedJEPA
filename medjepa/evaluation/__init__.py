@@ -1,7 +1,7 @@
 """Evaluation: linear probing, few-shot, segmentation, fine-tuning, baselines."""
 
 from medjepa.evaluation.linear_probe import LinearProbe, LinearProbeEvaluator
-from medjepa.evaluation.few_shot import FewShotEvaluator
+from medjepa.evaluation.few_shot import FewShotEvaluator, PrototypeNetworkEvaluator
 from medjepa.evaluation.segmentation import (
     SimpleSegmentationHead,
     SegmentationEvaluator,
@@ -16,6 +16,7 @@ __all__ = [
     "LinearProbe",
     "LinearProbeEvaluator",
     "FewShotEvaluator",
+    "PrototypeNetworkEvaluator",
     "SimpleSegmentationHead",
     "SegmentationEvaluator",
     "dice_score",

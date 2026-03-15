@@ -17,9 +17,7 @@ setup(
         "pandas",
         "matplotlib",
         "scikit-learn",
-        "pydicom",
         "nibabel",
-        "monai",
         "albumentations",
         "opencv-python",
         "Pillow",
@@ -27,6 +25,11 @@ setup(
         "pyyaml",
     ],
     extras_require={
+        "medical": [
+            "pydicom",
+            "monai",
+            "SimpleITK",
+        ],
         "dev": [
             "pytest",
             "black",
@@ -35,6 +38,9 @@ setup(
         "wandb": [
             "wandb",
             "tensorboard",
+        ],
+        "all": [
+            "medjepa[medical,wandb,dev]",
         ],
     },
     classifiers=[
