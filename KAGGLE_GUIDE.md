@@ -98,23 +98,37 @@ This session downloads datasets and trains LeJEPA from scratch.
 # ============================================================
 # CELL 1: Get the code from GitHub and install it
 # ============================================================
-# IMPORTANT: Use /kaggle/working/ (70GB) — NOT the root filesystem (5GB)
 import os, shutil, subprocess
 
-# ── show disk usage so you can diagnose if something is wrong ────────
+# ── STEP 1: move to / first so we can safely delete /kaggle/working/* ─
+# (if current dir is inside /kaggle/working/MedJEPA and we delete it,
+#  the shell dies with "getcwd: No such file or directory")
+os.chdir('/')
+
+# ── STEP 2: show what is eating disk space ────────────────────────────
+print("── Disk before cleanup ──────────────────────")
+subprocess.run(['df', '-h', '/kaggle/working'], check=False)
+subprocess.run('du -sh /kaggle/working/* 2>/dev/null | sort -rh | head -15',
+               shell=True, check=False)
+
+# ── STEP 3: wipe ALL of /kaggle/working/ to start fresh ──────────────
+# /kaggle/input/ (read-only datasets you added) is NOT touched.
+# Everything inside /kaggle/working/ is rebuilt by the cells below.
+print("\n── Wiping /kaggle/working/ ──────────────────")
+for name in os.listdir('/kaggle/working'):
+    full = f'/kaggle/working/{name}'
+    try:
+        shutil.rmtree(full) if os.path.isdir(full) else os.remove(full)
+        print(f"  removed {full}")
+    except Exception as e:
+        print(f"  skip    {full}: {e}")
+
+print("\n── Disk after cleanup ───────────────────────")
 subprocess.run(['df', '-h', '/kaggle/working'], check=False)
 
-# ── remove stale artifacts from any previous run ─────────────────────
-# This is safe: data/ is re-downloaded in Cell 2 anyway
-for stale in ['/kaggle/working/MedJEPA',
-              '/kaggle/working/pip_cache',
-              '/kaggle/working/tmp']:
-    if os.path.exists(stale):
-        print(f"Cleaning up {stale} ...")
-        shutil.rmtree(stale, ignore_errors=True)
-
+# ── STEP 4: clone into /kaggle/working/ (plenty of room now) ─────────
 os.makedirs('/kaggle/working/tmp', exist_ok=True)
-os.environ['GIT_TMPDIR'] = '/kaggle/working/tmp'   # git temp → big disk
+os.environ['GIT_TMPDIR'] = '/kaggle/working/tmp'   # git temp files → here
 
 !git clone --depth 1 https://github.com/prthmmkhija1/MedJEPA.git /kaggle/working/MedJEPA
 %cd /kaggle/working/MedJEPA
@@ -283,20 +297,29 @@ fixed kNN code.
 # ============================================================
 # CELL 1: Clone and install (same as Session 1)
 # ============================================================
-# IMPORTANT: Use /kaggle/working/ (70GB) — NOT the root filesystem (5GB)
 import os, shutil, subprocess
 
+os.chdir('/')   # step away from /kaggle/working/* before wiping it
+
+print("── Disk before cleanup ──────────────────────")
+subprocess.run(['df', '-h', '/kaggle/working'], check=False)
+subprocess.run('du -sh /kaggle/working/* 2>/dev/null | sort -rh | head -15',
+               shell=True, check=False)
+
+print("\n── Wiping /kaggle/working/ ──────────────────")
+for name in os.listdir('/kaggle/working'):
+    full = f'/kaggle/working/{name}'
+    try:
+        shutil.rmtree(full) if os.path.isdir(full) else os.remove(full)
+        print(f"  removed {full}")
+    except Exception as e:
+        print(f"  skip    {full}: {e}")
+
+print("\n── Disk after cleanup ───────────────────────")
 subprocess.run(['df', '-h', '/kaggle/working'], check=False)
 
-for stale in ['/kaggle/working/MedJEPA',
-              '/kaggle/working/pip_cache',
-              '/kaggle/working/tmp']:
-    if os.path.exists(stale):
-        print(f"Cleaning up {stale} ...")
-        shutil.rmtree(stale, ignore_errors=True)
-
 os.makedirs('/kaggle/working/tmp', exist_ok=True)
-os.environ['GIT_TMPDIR'] = '/kaggle/working/tmp'   # git temp → big disk
+os.environ['GIT_TMPDIR'] = '/kaggle/working/tmp'
 
 !git clone --depth 1 https://github.com/prthmmkhija1/MedJEPA.git /kaggle/working/MedJEPA
 %cd /kaggle/working/MedJEPA
@@ -653,30 +676,33 @@ git push
 
 ## Troubleshooting
 
-### "No space left on device" during git clone / pip install
+### "No space left on device" / "getcwd: No such file or directory"
 
-`/kaggle/working/` (70 GB) is full — usually from a previous run's datasets
-or pip cache. Fix: clean up stale files before cloning.
+Two things happen together:
+1. `/kaggle/working/` is 100% full from a previous run's datasets/cache
+2. If you delete the folder you're currently inside, git/shell dies with
+   "getcwd: No such file or directory"
+
+Fix — paste this into a fresh cell and run it **before** Cell 1:
 
 ```python
-import shutil, subprocess
+import os, shutil, subprocess
 
-# See what's eating space
+os.chdir('/')   # <-- critical: move out of /kaggle/working/ first
+
+# Show what's eating the disk
 subprocess.run(['df', '-h', '/kaggle/working'], check=False)
-subprocess.run(['du', '-sh', '/kaggle/working/*'], shell=True, check=False)
+subprocess.run('du -sh /kaggle/working/* 2>/dev/null | sort -rh', shell=True, check=False)
 
-# Remove stale artifacts (datasets will be re-downloaded in Cell 2)
-for stale in ['/kaggle/working/MedJEPA',
-              '/kaggle/working/pip_cache',
-              '/kaggle/working/tmp']:
-    shutil.rmtree(stale, ignore_errors=True)
-    print(f"Removed {stale}")
+# Wipe everything in /kaggle/working/ (safe — Cell 2 re-downloads data)
+for name in os.listdir('/kaggle/working'):
+    full = f'/kaggle/working/{name}'
+    shutil.rmtree(full) if os.path.isdir(full) else os.remove(full)
+    print(f"removed {full}")
 
-# If the datasets directory itself is huge, clear it too
-shutil.rmtree('/kaggle/working/MedJEPA/data', ignore_errors=True)
+subprocess.run(['df', '-h', '/kaggle/working'], check=False)
+print("Disk cleared — now run Cell 1 again")
 ```
-
-Then re-run Cell 1.
 
 ---
 
