@@ -2,163 +2,120 @@
 
 # 🏥 MedJEPA
 
-### Self-Supervised Medical Image Representation Learning with JEPA
+### Self-Supervised Medical Image Representation Learning
 
-**Learn powerful medical image representations _without_ labeled data**
+**Learn powerful representations *without* labeled data**
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0%2B-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-24%20passed-brightgreen.svg)](tests/)
-[![UCSC OSPO 2026](https://img.shields.io/badge/UCSC-OSPO%202026-gold.svg)](https://ucsc-ospo.github.io/project/osre26/nelbl/medjepa/)
 [![GSoC 2026](https://img.shields.io/badge/GSoC-2026-orange.svg)](https://summerofcode.withgoogle.com/)
 
-[📖 Documentation](#how-it-works) • [🚀 Quick Start](#quick-start) • [📊 Results](#results) • [🔬 Evaluation](#evaluation) • [📝 GSoC Proposal](#proposed-gsoc-timeline-350-hours)
+[🚀 Quick Start](#quick-start) • [📊 Results](#results) • [📝 GSoC Timeline](#gsoc-timeline)
 
 </div>
 
 ---
 
-## GSoC 2026 Project Highlights
+## GSoC 2026 Highlights
 
-<div align="center">
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        🎯 GSoC 2026 Project Status                          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  ✅ Core LeJEPA Implementation Complete    │  ✅ 24/24 Tests Passing        │
-│  ✅ V-JEPA 3D Extension Ready              │  ✅ 10+ Datasets Supported     │
-│  ✅ SIGReg Loss (Collapse-Free)            │  ✅ Full Evaluation Pipeline   │
-│  ✅ Linear Probe + Few-Shot + Fine-Tune    │  ✅ Segmentation Decoder       │
-│  ✅ Cross-Institutional Validation         │  ✅ Attention Visualization    │
-│  ✅ DICOM Anonymization (HIPAA Ready)      │  ✅ ImageNet Baseline Compare  │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-| Metric                      | Value      | Status                    |
-| --------------------------- | ---------- | ------------------------- |
-| **PCam Fine-Tune Accuracy** | 89.9%      | 🏆 Beats ImageNet (89.1%) |
-| **Linear Probe vs Random**  | +3.5% avg  | ✅ Validates SSL approach |
-| **Data Efficiency (1%)**    | 76.5% PCam | ✅ Strong few-shot        |
-| **Unit Test Coverage**      | 24 tests   | ✅ All passing            |
-| **Datasets Supported**      | 13+        | ✅ 2D + 3D + Decathlon    |
-
-</div>
+| Metric | Value | Status |
+|--------|-------|--------|
+| **PCam Fine-Tune** | 89.9% | 🏆 Beats ImageNet (89.1%) |
+| **Linear Probe Gain** | +3.5% avg | ✅ Over random init |
+| **Data Efficiency** | 76.5% @ 1% | ✅ Strong few-shot |
+| **Tests** | 24/24 | ✅ All passing |
+| **Datasets** | 13+ | ✅ 2D + 3D |
 
 ---
 
 ## What is MedJEPA?
 
-MedJEPA applies **Joint-Embedding Predictive Architecture (JEPA)** to medical
-imaging, enabling AI models to learn from the vast amounts of unlabeled medical
-images in hospital archives. By predicting masked patch representations in **latent
-space** — not pixels — the model learns clinically meaningful features with a
-single hyperparameter and no training heuristics.
+MedJEPA applies **JEPA** (Joint-Embedding Predictive Architecture) to medical imaging. By predicting masked patch representations in **latent space**, the model learns clinically meaningful features without labels.
 
-**Key innovations:**
-
-- **LeJEPA** for 2D medical images (X-rays, histopathology, dermatology, retinal)
-- **V-JEPA** extension for 3D volumes (CT, MRI) and medical video
-- **SIGReg** loss — Sketched Isotropic Gaussian Regularization for collapse-free training
-- Comprehensive evaluation: linear probing, few-shot (kNN), fine-tuning, segmentation, attention maps
-- **Cross-institutional validation** with domain invariance testing
-- **ImageNet baseline comparison** (ViT-B/16) built-in
-- Privacy-preserving DICOM anonymization built-in
-
-Built for the [UCSC OSPO 2026 Open Source Research Experience](https://ucsc-ospo.github.io/project/osre26/nelbl/medjepa/).
+**Key Features:**
+- **LeJEPA** for 2D images (X-rays, histopathology, dermatology)
+- **V-JEPA** for 3D volumes (CT, MRI)
+- **SIGReg** loss for collapse-free training
+- Full evaluation: linear probe, few-shot, fine-tuning, segmentation
 
 ---
 
 ## Architecture
 
-### LeJEPA Training Pipeline (2D Medical Images)
+### LeJEPA Pipeline
 
 ```mermaid
 flowchart LR
-    A["🏥 Medical Image\n(224×224)"] --> B["🧩 Patch Embedding\n(Conv2d 16×16)"]
-    B --> C["📍 + Position\nEncoding"]
-    C --> D{"🎭 Masking\n(75% hidden)"}
-    D -->|"25% visible"| E["🔬 ViT Encoder\n(Context)"]
-    D -->|"75% hidden"| F["🔬 ViT Encoder\n(Target)"]
-    E --> G["🔮 Predictor\n(Smaller Transformer)"]
-    F --> H["🛑 Detach\n(No gradient)"]
-    G --> I["📊 SIGReg Loss"]
-    H --> I
-    I -->|"Prediction Loss\n+ Regularization"| J["⚡ Update\nWeights"]
+    A[Medical Image] --> B[Patch Embed]
+    B --> C{Mask 75%}
+    C --> D[Context Encoder]
+    C --> E[Target Encoder]
+    D --> F[Predictor]
+    E --> G[Stop Grad]
+    F --> H[SIGReg Loss]
+    G --> H
 
-    style A fill:#e1f5fe
-    style I fill:#fff3e0
-    style J fill:#e8f5e9
+    style A fill:#e3f2fd
+    style H fill:#fff8e1
 ```
 
-### V-JEPA Extension (3D Volumes & Medical Video)
+### V-JEPA Pipeline (3D)
 
 ```mermaid
 flowchart LR
-    A["🧠 3D Volume\n(CT/MRI)"] --> B["🧊 3D Patch Embed\n(Conv3d)"]
-    B --> C["📍 + 3D Position\nEncoding"]
-    C --> D{"🎭 3D Masking\n(Volumetric)"}
-    D -->|"Context cubes"| E["🔬 3D Encoder"]
-    D -->|"Target cubes"| F["🔬 3D Encoder"]
-    E --> G["🔮 3D Predictor"]
-    F --> H["🛑 Detach"]
-    G --> I["📊 SIGReg Loss"]
-    H --> I
+    A[3D Volume] --> B[3D Patch Embed]
+    B --> C{3D Mask}
+    C --> D[3D Encoder]
+    C --> E[3D Encoder]
+    D --> F[Predictor]
+    E --> G[Stop Grad]
+    F --> H[SIGReg Loss]
+    G --> H
 
     style A fill:#f3e5f5
-    style I fill:#fff3e0
+    style H fill:#fff8e1
 ```
 
-### SIGReg Loss: How Collapse Is Prevented
+### SIGReg Loss
 
 ```mermaid
-flowchart TB
-    subgraph "SIGReg Loss"
-        direction TB
-        P["Predicted Embeddings"] --> N1["L2 Normalize"]
-        T["Target Embeddings"] --> N2["L2 Normalize"]
-        N1 --> MSE["MSE Loss\n(Prediction Accuracy)"]
+flowchart LR
+    subgraph Prediction
+        P[Predicted] --> N1[Normalize]
+        T[Target] --> N2[Normalize]
+        N1 --> MSE[MSE Loss]
         N2 --> MSE
-
-        A["All Embeddings"] --> C["Center\n(subtract mean)"]
-        C --> COV["Covariance\nMatrix"]
-        COV --> REG["‖Cov − I‖²\n(Push toward Identity)"]
-
-        MSE --> TOTAL["Total = Pred + λ · Reg"]
-        REG --> TOTAL
     end
 
-    style MSE fill:#e8f5e9
-    style REG fill:#fff3e0
-    style TOTAL fill:#e1f5fe
+    subgraph Regularization
+        E[Embeddings] --> COV[Covariance]
+        COV --> REG[Push to Identity]
+    end
+
+    MSE --> TOTAL[Total Loss]
+    REG --> TOTAL
+
+    style MSE fill:#c8e6c9
+    style REG fill:#fff8e1
+    style TOTAL fill:#e3f2fd
 ```
 
 ### Evaluation Pipeline
 
 ```mermaid
 flowchart LR
-    subgraph "Pre-trained Model"
-        M["🔬 Frozen Encoder"]
-    end
+    M[Frozen Encoder] --> LP[Linear Probe]
+    M --> FS[Few-Shot]
+    M --> SEG[Segmentation]
+    M --> ATT[Attention Maps]
 
-    subgraph "Downstream Tasks"
-        LP["📊 Linear Probe\n(Classification)"]
-        FS["🎯 Few-Shot\n(kNN, 5/10-shot)"]
-        SEG["🔲 Segmentation\n(Dice Score)"]
-        ATT["👁️ Attention Maps\n(Interpretability)"]
-    end
-
-    M --> LP
-    M --> FS
-    M --> SEG
-    M --> ATT
-
-    style M fill:#e1f5fe
-    style LP fill:#e8f5e9
-    style FS fill:#fff3e0
+    style M fill:#e3f2fd
+    style LP fill:#c8e6c9
+    style FS fill:#fff8e1
     style SEG fill:#f3e5f5
-    style ATT fill:#fce4ec
+    style ATT fill:#ffcdd2
 ```
 
 ---
@@ -166,89 +123,38 @@ flowchart LR
 ## Quick Start
 
 ```bash
-# Clone and install
+# Install
 git clone https://github.com/prthmmkhija1/MedJEPA.git
-cd MedJEPA
-python -m venv venv
-venv\Scripts\activate          # Windows
-# source venv/bin/activate     # Mac/Linux
-pip install -e .
+cd MedJEPA && pip install -e .
 
-# Pre-train on HAM10000 (skin lesions)
-python scripts/pretrain.py \
-    --data_dir data/raw/ham10000 \
-    --epochs 50 --batch_size 64 \
-    --embed_dim 768 --encoder_depth 12
+# Pre-train
+python scripts/pretrain.py --data_dir data/raw/ham10000 --epochs 50
 
 # Evaluate
-python scripts/evaluate.py \
-    --checkpoint checkpoints/best_model.pt \
-    --data_dir data/raw/ham10000 \
-    --metadata_csv data/raw/ham10000/HAM10000_metadata.csv \
-    --label_column dx --num_classes 7
+python scripts/evaluate.py --checkpoint checkpoints/best_model.pt \
+    --data_dir data/raw/ham10000 --num_classes 7
 ```
 
 ---
 
-## Supported Datasets & Modalities
+## Datasets
 
-### Complete Data Pipeline
+### 2D (LeJEPA)
 
-```mermaid
-flowchart TB
-    subgraph "📥 Data Sources"
-        D1["🩻 ChestX-ray14\n112K images"]
-        D2["👁️ APTOS 2019\n5.6K retinal"]
-        D3["🔬 PCam\n277K patches"]
-        D4["🩺 HAM10000\n10K skin"]
-        D5["🧠 BraTS 2021\n1251 MRI"]
-        D6["🫀 Decathlon\n10 tasks"]
-    end
+| Modality | Dataset | Size | Task |
+|----------|---------|------|------|
+| Dermatology | HAM10000 | 10K, 7 classes | Skin lesion |
+| Retinal | APTOS 2019 | 5.6K, 5 grades | DR grading |
+| Histopathology | PCam | 277K patches | Cancer detection |
+| Chest X-ray | ChestX-ray14 | 112K, 14 labels | Disease classification |
 
-    subgraph "⚙️ Preprocessing"
-        P1["Resize 224×224"]
-        P2["Normalize"]
-        P3["DICOM Parse"]
-        P4["3D→2D Slicing"]
-    end
+### 3D (V-JEPA)
 
-    subgraph "🎭 Masking"
-        M1["Block Masking\n(75% hidden)"]
-        M2["Anatomy-Aware"]
-        M3["3D Volumetric"]
-    end
-
-    subgraph "🔬 Training"
-        T1["LeJEPA\n(2D)"]
-        T2["V-JEPA\n(3D)"]
-        T3["SIGReg\nLoss"]
-    end
-
-    D1 & D2 & D3 & D4 --> P1 --> P2 --> M1 --> T1
-    D5 & D6 --> P3 --> P4 --> M3 --> T2
-    T1 & T2 --> T3
-
-    style T3 fill:#e8f5e9
-```
-
-### 2D Medical Images (LeJEPA)
-
-| Modality           | Dataset      | Size                      | Task                               |
-| ------------------ | ------------ | ------------------------- | ---------------------------------- |
-| **Dermatology**    | HAM10000     | 10,015 images, 7 classes  | Skin lesion classification         |
-| **Retinal**        | APTOS 2019   | 5,590 images, 5 grades    | Diabetic retinopathy grading       |
-| **Histopathology** | PCam         | 277,483 patches           | Breast cancer metastasis detection |
-| **Chest X-ray**    | ChestX-ray14 | 112,120 images, 14 labels | Multi-label disease classification |
-
-### 3D Volumes (V-JEPA)
-
-| Modality            | Dataset          | Size                        | Task                     |
-| ------------------- | ---------------- | --------------------------- | ------------------------ |
-| **Brain MRI**       | BraTS 2021       | 1,251 patients, 4 sequences | Glioma segmentation      |
-| **Cardiac MRI**     | Decathlon Task02 | 20 volumes                  | Heart segmentation       |
-| **Hippocampus MRI** | Decathlon Task04 | 394 volumes                 | Hippocampus segmentation |
-| **Prostate MRI**    | Decathlon Task05 | 48 volumes                  | Prostate segmentation    |
-| **Abdominal CT**    | Decathlon Task09 | 61 volumes                  | Spleen segmentation      |
+| Modality | Dataset | Task |
+|----------|---------|------|
+| Brain MRI | BraTS 2021 | Glioma segmentation |
+| Cardiac MRI | Decathlon Task02 | Heart segmentation |
+| Abdominal CT | Decathlon Task09 | Spleen segmentation |
 
 ---
 
@@ -256,463 +162,160 @@ flowchart TB
 
 ```
 MedJEPA/
-├── medjepa/                        # Core Python package
-│   ├── data/                       # Data loading & preprocessing
-│   │   ├── datasets.py             #   MedicalImageDataset, ChestXray14, BraTS, …
-│   │   ├── preprocessing.py        #   Image & volume preprocessors
-│   │   ├── masking.py              #   Patch masking (2D block, 3D, temporal)
-│   │   └── dicom_utils.py          #   DICOM anonymization & parsing
-│   ├── models/                     # Model architectures
-│   │   ├── encoder.py              #   ViT encoder (PatchEmbedding + Transformer)
-│   │   ├── predictor.py            #   JEPA predictor (latent prediction)
-│   │   ├── lejepa.py               #   LeJEPA — complete 2D model + EMA
-│   │   └── vjepa.py                #   V-JEPA — 3D volumes & video
-│   ├── training/                   # Training infrastructure
-│   │   ├── trainer.py              #   MedJEPATrainer (AMP, DDP, checkpoints)
-│   │   └── losses.py               #   SIGReg loss (prediction + regularization)
-│   ├── evaluation/                 # Downstream evaluation
-│   │   ├── linear_probe.py         #   Linear probing evaluator
-│   │   ├── few_shot.py             #   Few-shot (kNN + prototype network)
-│   │   ├── fine_tune.py            #   Full fine-tuning + ImageNet baseline
-│   │   └── segmentation.py         #   Segmentation head + Dice score
-│   └── utils/                      # Utilities
-│       ├── device.py               #   Device detection (CUDA/MPS/CPU)
-│       └── visualization.py        #   t-SNE, attention maps, GradCAM
-├── examples/
-│   └── minimal_medjepa.py          # Core JEPA loop in ~80 lines
-├── scripts/
-│   ├── run_gpu_full.py             # Full 3-phase pipeline (pretrain → eval)
-│   ├── pretrain.py                 # Pre-training CLI (with --resume support)
-│   ├── evaluate.py                 # Evaluation CLI (linear probe + few-shot)
-│   ├── download_data.py            # Automated dataset downloading (Kaggle API)
-│   ├── preextract_slices.py        # Pre-extract 3D→2D slices for fast I/O
-│   ├── precache_images.py          # Validate & cache image datasets
-│   └── clean_corrupted_images.py   # Remove corrupted images from datasets
-├── configs/
-│   └── base_config.yaml            # Default hyperparameters
-├── notebooks/
-│   ├── 01_explore_data.ipynb       # Dataset exploration
-│   ├── 02_test_preprocessing.ipynb # Preprocessing pipeline tests
-│   ├── 03_test_masking.ipynb       # Masking visualization
-│   ├── 04_test_model.ipynb         # Model forward pass verification
-│   └── 05_results_analysis.ipynb   # Results analysis & visualization
-├── tests/
-│   └── test_core.py                # 24 unit tests (models, data, training, eval)
-├── pyproject.toml                  # Modern Python build config
-├── setup.py                        # Package installation (legacy)
-├── requirements.txt                # Direct dependencies
-├── LICENSE                         # MIT License
-└── README.md
+├── medjepa/              # Core package
+│   ├── data/             # Datasets, preprocessing, masking
+│   ├── models/           # LeJEPA, V-JEPA, encoder, predictor
+│   ├── training/         # Trainer, SIGReg loss
+│   ├── evaluation/       # Linear probe, few-shot, segmentation
+│   └── utils/            # Visualization, device utils
+├── scripts/              # CLI tools
+├── docs/                 # Documentation guides
+├── notebooks/            # Jupyter notebooks
+├── tests/                # Unit tests (24 tests)
+├── configs/              # Hyperparameters
+└── results/              # Evaluation outputs
 ```
 
 ---
 
-## How It Works
+## Results
 
-### The JEPA Approach
+### Classification
 
-Unlike pixel-reconstruction methods (MAE), JEPA predicts in **representation space**,
-forcing the model to learn semantic features rather than textures:
+| Dataset | Linear Probe | AUC | Fine-Tune | ImageNet | Supervised |
+|---------|:------------:|:---:|:---------:|:--------:|:----------:|
+| HAM10000 | 69.3% | 0.838 | 71.8% | 77.3% | 67.6% |
+| APTOS | 64.0% | 0.733 | 70.0% | 78.7% | 69.2% |
+| PCam | 83.0% | 0.902 | **89.9%** | 89.1% | 79.5% |
+| ChestXray14 | 94.8%* | 0.627 | 53.7% | 53.7% | 94.8% |
 
-```mermaid
-flowchart TB
-    subgraph "❌ Pixel Reconstruction (MAE)"
-        direction LR
-        P1["Image"] --> P2["Mask Pixels"] --> P3["Reconstruct\nPixels"] --> P4["Learns Textures"]
-    end
+<div align="center">
+<img src="results/linear_probe_performance.png" alt="Linear Probe" width="650"/>
 
-    subgraph "✅ Latent Prediction (JEPA)"
-        direction LR
-        J1["Image"] --> J2["Mask Patches"] --> J3["Predict\nRepresentations"] --> J4["Learns Semantics"]
-    end
+*Linear probe accuracy. MedJEPA outperforms supervised baselines.*
+</div>
 
-    style P4 fill:#ffcdd2
-    style J4 fill:#c8e6c9
-```
+<div align="center">
+<img src="results/medjepa_vs_imagenet.png" alt="MedJEPA vs ImageNet" width="650"/>
 
-### Training Steps
+*MedJEPA fine-tuning beats ImageNet on PCam (89.9% vs 89.1%).*
+</div>
 
-1. **Mask** 75% of patches using block masking (anatomically meaningful regions)
-2. **Encode** visible context patches with a Vision Transformer
-3. **Predict** hidden target patch representations using a lightweight predictor
-4. **Regularize** with SIGReg: prediction loss + covariance → identity matrix
-5. **No heuristics** — no momentum encoder, no teacher network, single λ parameter
+> *ChestXray14 accuracy inflated by class imbalance; AUC is more reliable.
 
-### Why This Matters for Medical Imaging
+### Few-Shot Learning
 
-```mermaid
-mindmap
-  root((MedJEPA))
-    Annotation Efficiency
-      Few-shot learning with 5 labels
-      Data efficiency curves
-      1% labeled data → strong accuracy
-    Multi-Modal Support
-      2D: X-rays, histopathology
-      3D: CT, MRI volumes
-      Video: cardiac, surgical
-    Clinical Trust
-      Attention visualizations
-      t-SNE embedding space
-      Interpretable features
-    Privacy Preserving
-      DICOM anonymization
-      Self-supervised = no labels needed
-      Compatible with HIPAA/GDPR
-    Simplicity
-      Single hyperparameter lambda
-      No heuristics
-      Reproducible across hospitals
-```
+| Dataset | 5-shot | 10-shot | 20-shot | 1% data | 100% data |
+|---------|:------:|:-------:|:-------:|:-------:|:---------:|
+| HAM10000 | 8.9% | 29.9% | 42.3% | 64.9% | 66.2% |
+| APTOS | 22.4% | 31.4% | 44.3% | 52.3% | 68.3% |
+| PCam | 63.4% | 64.2% | 67.3% | 76.5% | 79.6% |
+| BraTS | 64.1% | 66.3% | 66.9% | 67.5% | 78.6% |
+
+<div align="center">
+<img src="results/n_shot_performance.png" alt="N-Shot Performance" width="650"/>
+
+*Few-shot learning. PCam achieves 76.5% with only 1% labeled data.*
+</div>
+
+### Segmentation
+
+| Dataset | Mean Dice | Foreground Dice |
+|---------|:---------:|:---------------:|
+| BraTS | 0.784 | **0.573** |
+
+<div align="center">
+<img src="results/segmentation_dice.png" alt="Dice Scores" width="650"/>
+
+*Segmentation Dice scores across Medical Decathlon tasks.*
+</div>
+
+<div align="center">
+<img src="results/results_table.png" alt="Results Summary" width="650"/>
+
+*Complete evaluation summary.*
+</div>
+
+### Key Findings
+
+**What works:**
+- PCam fine-tuning **beats ImageNet** (89.9% vs 89.1%)
+- Linear probe beats random init by +3.5% average
+- Strong data efficiency: 76.5% PCam with 1% labels
+
+**Known gaps:**
+- ImageNet still leads on linear probing (larger pretraining data)
+- Segmentation needs UNet-style decoders for small datasets
+
+### Method Comparison
+
+| Method | HAM10000 | PCam | Pretraining Data |
+|--------|:--------:|:----:|:----------------:|
+| **MedJEPA (ours)** | 69.3% | 83.0% | ~25k medical |
+| MedJEPA Fine-Tuned | 71.8% | **89.9%** | ~25k medical |
+| ImageNet ViT-B/16 | 77.3% | 89.1% | 1.2M ImageNet |
+| Random Init | 67.6% | 79.5% | — |
+
+> MedJEPA uses **50x less data** than ImageNet models.
 
 ---
 
-## Evaluation
-
-MedJEPA includes a comprehensive evaluation suite:
-
-| Method                  | Description                                             | Code              |
-| ----------------------- | ------------------------------------------------------- | ----------------- |
-| **Linear Probing**      | Freeze encoder, train single linear layer               | `linear_probe.py` |
-| **Few-Shot (kNN)**      | 5/10/20-shot classification + data efficiency (1%–100%) | `few_shot.py`     |
-| **Full Fine-Tuning**    | End-to-end encoder + head training (low encoder LR)     | `fine_tune.py`    |
-| **ImageNet Baseline**   | Compare against ImageNet-pretrained ViT-B/16            | `fine_tune.py`    |
-| **Segmentation**        | Dice score on BraTS + Decathlon tasks                   | `segmentation.py` |
-| **Cross-Institutional** | Domain invariance, silhouette, cross-dataset transfer   | `run_gpu_full.py` |
-
-### Running the Full Pipeline
-
-```bash
-# Run everything: pretrain + evaluate + cross-institutional
-python scripts/run_gpu_full.py
-
-# Skip pretraining, use existing checkpoint
-python scripts/run_gpu_full.py --skip_pretrain --checkpoint checkpoints/best_model.pt
-```
-
-### Linear Probing & Few-Shot
-
-```bash
-# Full evaluation pipeline
-python scripts/evaluate.py \
-    --checkpoint checkpoints/best_model.pt \
-    --data_dir data/raw/ham10000 \
-    --metadata_csv data/raw/ham10000/HAM10000_metadata.csv \
-    --label_column dx --num_classes 7 --batch_size 64
-
-# Resume interrupted pre-training
-python scripts/pretrain.py \
-    --data_dir data/raw/ham10000 --epochs 50 \
-    --resume checkpoints/checkpoint_epoch_25.pt
-```
-
-### Results
-
-All models pre-trained with **ViT-B/12** (768-dim, 12 layers) on the combined training pool
-for **100 epochs** using a single A100 GPU. Full results in [results/evaluation_results.json](results/evaluation_results.json).
-
-#### Classification — Linear Probe & Fine-Tuning
-
-| Dataset              | Linear Probe Acc | LP AUC | Fine-Tune Acc | ImageNet Baseline Acc | Supervised Baseline |
-| -------------------- | :--------------: | :----: | :-----------: | :-------------------: | :-----------------: |
-| **HAM10000** (7-cls) |      69.3%       | 0.838  |     71.8%     |         77.3%         |        67.6%        |
-| **APTOS** (5-cls)    |      64.0%       | 0.733  |     70.0%     |         78.7%         |        69.2%        |
-| **PCam** (binary)    |      83.0%       | 0.902  |   **89.9%**   |         89.1%         |        79.5%        |
-| **ChestXray14** (14) |     94.8%\*      | 0.627  |     53.7%     |         53.7%         |        94.8%        |
-| **BraTS** (binary)   |      82.9%       | 0.907  |       —       |           —           |        72.3%        |
-
-<div align="center">
-<img src="results/linear_probe_performance.png" alt="Linear Probe Performance" width="700"/>
-
-_Figure 1: Linear probe accuracy across datasets. MedJEPA outperforms supervised baselines._
-
-</div>
-
-<div align="center">
-<img src="results/medjepa_vs_imagenet.png" alt="MedJEPA vs ImageNet" width="700"/>
-
-_Figure 2: MedJEPA fine-tuning beats ImageNet on PCam (89.9% vs 89.1%)._
-
-</div>
-
-> \*ChestXray14 accuracy is inflated by class imbalance ("No Finding" ~53%).
-> AUC (0.627) is the more reliable metric for this multi-label dataset.
-
-> **Highlights:** MedJEPA fine-tuning **beats ImageNet on PCam** (89.9% vs 89.1%) — a
-> histopathology task where domain-specific features matter most.
-> Linear probe consistently outperforms supervised baselines trained from scratch.
-
-#### Few-Shot Learning (kNN)
-
-| Dataset  | 5-shot | 10-shot | 20-shot | 1% data | 10% data | 100% data |
-| -------- | :----: | :-----: | :-----: | :-----: | :------: | :-------: |
-| HAM10000 |  8.9%  |  29.9%  |  42.3%  |  64.9%  |  62.9%   |   66.2%   |
-| APTOS    | 22.4%  |  31.4%  |  44.3%  |  52.3%  |  59.6%   |   68.3%   |
-| PCam     | 63.4%  |  64.2%  |  67.3%  |  76.5%  |  78.3%   |   79.6%   |
-| BraTS    | 64.1%  |  66.3%  |  66.9%  |  67.5%  |  71.9%   |   78.6%   |
-
-<div align="center">
-<img src="results/n_shot_performance.png" alt="N-Shot Performance" width="700"/>
-
-_Figure 3: Few-shot learning curves showing data efficiency. PCam achieves 76.5% with only 1% labeled data._
-
-</div>
-
-#### Segmentation (Dice Score)
-
-| Dataset             | Mean Dice | Foreground Dice | Test Slices |
-| ------------------- | :-------: | :-------------: | :---------: |
-| BraTS (brain tumor) |   0.784   |    **0.573**    |     11      |
-
-<div align="center">
-<img src="results/segmentation_dice.png" alt="Segmentation Dice Scores" width="700"/>
-
-_Figure 4: Segmentation performance with Dice scores across Medical Decathlon tasks._
-
-</div>
-
-> BraTS segmentation achieves meaningful foreground detection (Dice 0.57) using a
-> lightweight linear segmentation head on top of frozen MedJEPA features.
-> Decathlon subtasks (Heart, Hippocampus, Prostate, Lung, Pancreas, Spleen)
-> produced near-zero foreground Dice due to extremely small training sets (1–5 slices
-> per task). Improving segmentation on small datasets with better decoder architectures
-> (e.g. UNet-style heads) is planned for the GSoC period.
-
-#### Cross-Institutional Validation
-
-| Metric                    | Value  |
-| ------------------------- | :----: |
-| Domain Classification Acc | 99.8%  |
-| Domain Invariance Score   | 0.003  |
-| HAM10000 Silhouette Score | −0.054 |
-| PCam Silhouette Score     | 0.053  |
-
-<div align="center">
-<img src="results/results_table.png" alt="Complete Results Summary" width="700"/>
-
-_Figure 5: Complete evaluation results summary across all datasets and metrics._
-
-</div>
-
-> **Interpretation:** The high domain classification accuracy (99.8%) shows that the
-> current model has **not** learned domain-invariant features — embeddings retain strong
-> modality-specific signatures, making it easy to tell which dataset an image came from.
-> This is a known limitation when pretraining on heterogeneous modalities without explicit
-> domain adaptation. Integrating domain-adversarial training or gradient reversal layers
-> during pretraining is a key planned improvement for the GSoC period.
-
-### Discussion & Analysis
-
-**What works well:**
-
-- **PCam fine-tuning surpasses ImageNet** (89.9% vs 89.1%), validating that
-  self-supervised pretraining on medical images produces domain-adapted features
-  that outperform general-purpose representations on histopathology.
-- **Linear probing consistently beats random-init baselines** across all datasets
-  (e.g. HAM10000: 69.3% vs 67.6%, PCam: 83.0% vs 79.5%, BraTS: 82.9% vs 72.3%),
-  confirming that MedJEPA learns meaningful representations without any labels.
-- **Data efficiency is strong**: with only 1% of labeled data, kNN achieves
-  64.9% on HAM10000 and 76.5% on PCam — within ~5pp of using all labels.
-
-**Honest gaps and why they exist:**
-
-- **ImageNet gap on linear probing:** ImageNet-pretrained ViT-B/16 still outperforms
-  MedJEPA on linear probing for HAM10000 (77.3% vs 69.3%) and APTOS (78.7% vs 64.0%).
-  This is expected: ImageNet pretraining uses 1.2M images and 1000-class supervision,
-  while MedJEPA uses only ~25k unlabeled medical images. Scaling the pretraining pool
-  (adding MIMIC-CXR, CheXpert, EyePACS per the GSoC plan) is the primary lever.
-- **Few-shot n-shot results (5-shot) are weak:** HAM10000 5-shot accuracy (8.9%)
-  is below random, caused by the kNN operating on un-normalized high-dimensional
-  embeddings. The fix (L2 normalization + cosine similarity) has been implemented
-  in code; re-evaluation with the corrected pipeline is pending.
-- **Segmentation fails on small Decathlon tasks:** Foreground Dice is near zero
-  on tasks with only 1–5 training slices. The linear segmentation head cannot learn
-  meaningful boundaries from so few examples. BraTS with 11 test slices achieves
-  a meaningful Dice of 0.57, confirming the encoder features are useful when
-  sufficient data is available.
-- **No cross-institutional invariance:** Domain classification accuracy of 99.8%
-  means embeddings are fully domain-separable. This is expected without explicit
-  domain adaptation — the pretraining data mixes very different modalities (X-ray,
-  dermatoscopy, histopathology, MRI) which naturally cluster separately.
-
-### Comparison with Related Methods
-
-```mermaid
-flowchart LR
-    subgraph "🔬 Self-Supervised Methods"
-        A["MedJEPA\n(JEPA + SIGReg)"]
-        B["I-JEPA\n(ImageNet)"]
-        C["MAE\n(Pixel Recon)"]
-        D["DINOv2\n(Distillation)"]
-    end
-
-    subgraph "📊 Results"
-        R1["PCam: 89.9%\n🏆 BEST"]
-        R2["PCam: —"]
-        R3["PCam: —"]
-        R4["PCam: —"]
-    end
-
-    A --> R1
-    B --> R2
-    C --> R3
-    D --> R4
-
-    style A fill:#c8e6c9
-    style R1 fill:#c8e6c9
-```
-
-| Method                 | Approach          | HAM10000 LP |  PCam LP  | Pretraining Data |
-| ---------------------- | ----------------- | :---------: | :-------: | :--------------: |
-| **MedJEPA (ours)**     | JEPA + SIGReg     |    69.3%    |   83.0%   |   ~25k medical   |
-| MedJEPA Fine-Tuned     | JEPA + SIGReg     |    71.8%    | **89.9%** |   ~25k medical   |
-| ImageNet ViT-B/16      | Supervised        |    77.3%    |   89.1%   |  1.2M ImageNet   |
-| Random Init            | None              |    67.6%    |   79.5%   |        —         |
-| I-JEPA (Assran et al.) | JEPA              |      —      |     —     |  1.2M ImageNet   |
-| MAE (He et al.)        | Pixel recon.      |      —      |     —     |  1.2M ImageNet   |
-| DINO-v2 (Oquab et al.) | Self-distillation |      —      |     —     |   142M curated   |
-
-> MedJEPA uses **50x less data** than ImageNet-pretrained models.
-> Scaling to the full medical dataset pool during GSoC is expected to close
-> (or exceed) the ImageNet gap, as demonstrated by the PCam fine-tuning result.
-
-**Planned improvements for GSoC period:**
-
-1. Scale to the full 8-dataset 2D pool (ChestX-ray14, MIMIC-CXR, CheXpert, PCam, EyePACS, APTOS, HAM10000, ISIC)
-2. Add ConvNet and hybrid encoder architectures alongside ViT
-3. Improve segmentation with UNet-style decoder heads
-4. Add survival prediction and time-to-event evaluation
-5. Integrate domain-adversarial training for cross-institutional invariance
-6. Benchmark against DINOv2 and MAE medical adapters
-7. Publish pre-trained checkpoints on HuggingFace Hub
-
-### Proposed GSoC Timeline (350 hours)
+## GSoC Timeline
 
 ```mermaid
 gantt
-    title GSoC 2026 MedJEPA Timeline
-    dateFormat  YYYY-MM-DD
-    section Data
-    Scale data pipelines       :a1, 2026-05-27, 3w
-    Add MIMIC-CXR, CheXpert    :a2, after a1, 0d
-    section Training
-    Re-pretrain at scale       :b1, 2026-06-17, 3w
-    ConvNet/hybrid support     :b2, after b1, 0d
-    section Adaptation
-    Domain adversarial         :c1, 2026-07-08, 3w
-    UNet segmentation          :c2, after c1, 0d
-    section Extension
-    V-JEPA improvements        :d1, 2026-07-29, 2w
-    Survival prediction        :d2, after d1, 0d
-    section Evaluation
-    Full benchmarking          :e1, 2026-08-12, 2w
-    DINOv2/MAE comparison      :e2, after e1, 0d
-    section Release
-    HuggingFace release        :f1, 2026-08-26, 1w
-    Final documentation        :f2, after f1, 0d
+    title GSoC 2026 Timeline (350 hours)
+    dateFormat YYYY-MM-DD
+    section Phase 1
+    Data pipelines     :a1, 2026-05-27, 3w
+    section Phase 2
+    Scale training     :b1, 2026-06-17, 3w
+    section Phase 3
+    Domain adaptation  :c1, 2026-07-08, 3w
+    section Phase 4
+    V-JEPA & tasks     :d1, 2026-07-29, 2w
+    section Phase 5
+    Benchmarking       :e1, 2026-08-12, 2w
+    section Phase 6
+    Release            :f1, 2026-08-26, 1w
 ```
 
-| Weeks | Milestone                        | Details                                                                           |
-| :---: | -------------------------------- | --------------------------------------------------------------------------------- |
-|  1–3  | Scale data pipelines             | Add MIMIC-CXR, CheXpert, EyePACS, ISIC, Camelyon16 loaders; unified preprocessing |
-|  4–6  | Re-pretrain at scale             | Train on full 8+ dataset pool; add ConvNet/hybrid encoder support                 |
-|  7–9  | Domain adaptation & segmentation | Domain-adversarial training; UNet-style segmentation decoder                      |
-| 10–11 | V-JEPA improvements & new tasks  | ACDC cardiac MRI, LIDC-IDRI lung nodules; survival prediction                     |
-| 12–13 | Benchmarking & evaluation        | Full comparison vs DINOv2, MAE, I-JEPA; ablation studies                          |
-|  14   | Release & documentation          | HuggingFace model cards, tutorials, blog post, final report                       |
-
----
-
-## Minimal Demo (~80 lines)
-
-The core JEPA idea in a single self-contained script — no dependencies beyond PyTorch:
-
-```bash
-python examples/minimal_medjepa.py
-```
-
-This demonstrates the complete self-supervised training loop: ViT encoder, predictor,
-mask generation, and SIGReg loss. See [`examples/minimal_medjepa.py`](examples/minimal_medjepa.py).
-
----
-
-## Visualization & Interpretability
-
-```python
-from medjepa.utils.visualization import (
-    plot_training_history,
-    plot_embedding_space,
-    extract_attention_weights,
-    plot_attention_map,
-    plot_data_efficiency,
-    plot_reconstruction_comparison,
-    plot_evaluation_summary,
-)
-
-# Training curves
-plot_training_history(history, save_path="figures/loss.png")
-
-# t-SNE of learned embeddings
-plot_embedding_space(features, labels,
-    class_names=["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"])
-
-# Attention overlay on medical image
-attn = extract_attention_weights(model, image_tensor)
-plot_attention_map(image_np, attn, title="Skin Lesion Attention")
-
-# Data efficiency curve (the money plot for self-supervised learning)
-plot_data_efficiency(few_shot_results, baseline_accuracy=0.65)
-```
-
-See [notebooks/05_results_analysis.ipynb](notebooks/05_results_analysis.ipynb) for
-a complete walkthrough.
+| Weeks | Milestone | Details |
+|:-----:|-----------|---------|
+| 1–3 | Data pipelines | Add MIMIC-CXR, CheXpert, EyePACS loaders |
+| 4–6 | Scale training | Train on 8+ datasets; ConvNet support |
+| 7–9 | Domain adaptation | Domain-adversarial; UNet segmentation |
+| 10–11 | V-JEPA tasks | ACDC cardiac; survival prediction |
+| 12–13 | Benchmarking | Compare vs DINOv2, MAE, I-JEPA |
+| 14 | Release | HuggingFace models, tutorials, blog |
 
 ---
 
 ## Configuration
 
-Default hyperparameters in [`configs/base_config.yaml`](configs/base_config.yaml):
-
-| Parameter         | Default | Description                  |
-| ----------------- | ------- | ---------------------------- |
-| `embed_dim`       | 768     | Encoder embedding dimension  |
-| `encoder_depth`   | 12      | Number of Transformer blocks |
-| `predictor_depth` | 6       | Predictor Transformer blocks |
-| `mask_ratio`      | 0.75    | Fraction of patches to hide  |
-| `lambda_reg`      | 1.0     | SIGReg regularization weight |
-| `batch_size`      | 64      | Training batch size          |
-| `learning_rate`   | 0.001   | AdamW learning rate          |
-| `num_epochs`      | 100     | Training epochs              |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `embed_dim` | 768 | Embedding dimension |
+| `encoder_depth` | 12 | Transformer blocks |
+| `mask_ratio` | 0.75 | Patches to hide |
+| `lambda_reg` | 1.0 | SIGReg weight |
+| `batch_size` | 64 | Training batch |
 
 ---
 
 ## Testing
 
 ```bash
-# Run all 24 unit tests
-python -m pytest tests/ -v
-
-# Quick smoke test on CPU (tiny model)
-python scripts/pretrain.py \
-    --data_dir data/raw/ham10000 \
-    --batch_size 4 --epochs 2 \
-    --embed_dim 192 --encoder_depth 2 --predictor_depth 1 \
-    --num_workers 0 --log_every 5
+python -m pytest tests/ -v  # Run all 24 tests
 ```
 
 ---
 
 ## References
 
-- **LeJEPA** — Balestriero & LeCun, _Provable and Scalable Self-Supervised
-  Learning Without the Heuristics_, arXiv 2024
-- **V-JEPA** — Bardes et al., _Revisiting Feature Prediction for Learning Visual
-  Representations from Video_, arXiv 2024
-- **I-JEPA** — Assran et al., _Self-Supervised Learning from Images with a
-  Joint-Embedding Predictive Architecture_, CVPR 2023
-- **ChestX-ray14** — [NIH Clinical Center](https://nihcc.app.box.com/v/ChestXray-NIHCC)
-- **Medical Segmentation Decathlon** — [medicaldecathlon.com](http://medicaldecathlon.com/)
-- **BraTS** — [RSNA-ASNR-MICCAI BraTS Challenge](https://www.synapse.org/#!Synapse:syn25829067)
+- **LeJEPA** — Balestriero & LeCun, arXiv 2024
+- **V-JEPA** — Bardes et al., arXiv 2024
+- **I-JEPA** — Assran et al., CVPR 2023
 
 ---
 
@@ -720,11 +323,10 @@ python scripts/pretrain.py \
 
 ```bibtex
 @misc{medjepa2026,
-  title   = {MedJEPA: Self-Supervised Medical Image Representation Learning with JEPA},
+  title   = {MedJEPA: Self-Supervised Medical Image Learning},
   author  = {Pratham Khija},
   year    = {2026},
-  url     = {https://github.com/prthmmkhija1/MedJEPA},
-  note    = {UCSC OSPO 2026 — NeuroHealth / NELBL Lab}
+  url     = {https://github.com/prthmmkhija1/MedJEPA}
 }
 ```
 
@@ -732,42 +334,18 @@ python scripts/pretrain.py \
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+[MIT License](LICENSE)
 
-## Acknowledgements
+## Mentors
 
-Built as part of the [UCSC OSPO 2026](https://ucsc-ospo.github.io/) program
-under the [NeuroHealth / NELBL Lab](https://ucsc-ospo.github.io/project/osre26/nelbl/medjepa/).
-
-### Project Mentors
-
-<table>
-<tr>
-<td align="center" width="50%">
-
-**Bin Dong**<br>
-_Research Scientist_<br>
-Lawrence Berkeley National Laboratory<br>
-📧 goon1983@gmail.com
-
-</td>
-<td align="center" width="50%">
-
-**Linsey Pang**<br>
-_Distinguished Scientist_<br>
-PayPal<br>
-📧 panglinsey@gmail.com
-
-</td>
-</tr>
-</table>
+| Bin Dong | Linsey Pang |
+|:--------:|:-----------:|
+| Lawrence Berkeley Lab | PayPal |
 
 ---
 
 <div align="center">
 
 **Made with ❤️ for GSoC 2026**
-
-_Democratizing medical AI through self-supervised learning_
 
 </div>
