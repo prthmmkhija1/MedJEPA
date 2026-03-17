@@ -1,6 +1,6 @@
-# MedJEPA — Kaggle Finishing Guide
+# MedJEPA — Kaggle Finishing Guide (5 Datasets)
 
-> **New approach:** Add datasets directly as Kaggle "Inputs" — they mount at
+> **Approach:** Add datasets directly as Kaggle "Inputs" — they mount at
 > `/kaggle/input/` and do **not** count against your 20 GB working disk.
 > No downloading, no disk-space errors.
 
@@ -8,12 +8,12 @@
 
 ## How This Works
 
-| Location | Size limit | What goes here |
-|---|---|---|
-| `/kaggle/working/` | 20 GB | Code clone, pip packages, checkpoints, results |
-| `/kaggle/input/` | Unlimited (read-only) | Datasets you add as Inputs |
+| Location           | Size limit            | What goes here                                 |
+| ------------------ | --------------------- | ---------------------------------------------- |
+| `/kaggle/working/` | 20 GB                 | Code clone, pip packages, checkpoints, results |
+| `/kaggle/input/`   | Unlimited (read-only) | Datasets you add as Inputs                     |
 
-We add HAM10000, APTOS, and BraTS as Inputs → they appear under `/kaggle/input/`
+We add all 5 datasets as Inputs → they appear under `/kaggle/input/`
 → Cell 2 creates symlinks so the training script finds them at `data/raw/`.
 
 ---
@@ -22,11 +22,13 @@ We add HAM10000, APTOS, and BraTS as Inputs → they appear under `/kaggle/input
 
 You only need to do this once. Go to each link and click **"+ Add"** / **"Add to notebook"**:
 
-| Dataset | Kaggle slug | Size |
-|---|---|---|
-| HAM10000 skin lesions | `kmader/skin-cancer-mnist-ham10000` | ~2 GB |
-| APTOS 2019 retinal | `benjaminwarner/aptos2019-blindness-detection` | ~3 GB |
-| BraTS 2021 brain MRI | `dschettler8845/brats-2021-task1` | ~2 GB |
+| Dataset               | Kaggle slug                                                | Size   |
+| --------------------- | ---------------------------------------------------------- | ------ |
+| HAM10000 skin lesions | `kmader/skin-cancer-mnist-ham10000`                        | ~2 GB  |
+| APTOS 2019 retinal    | `benjaminwarner/aptos2019-blindness-detection`             | ~3 GB  |
+| BraTS 2021 brain MRI  | `dschettler8845/brats-2021-task1`                          | ~2 GB  |
+| PatchCamelyon (PCam)  | `andrewmvd/metastatic-tissue-classification-patchcamelyon` | ~8 GB  |
+| ChestXray14 (NIH)     | `nih-chest-xrays/data`                                     | ~42 GB |
 
 To search for them: go to [kaggle.com/datasets](https://www.kaggle.com/datasets) and
 search the slug (the part after the `/`).
@@ -46,11 +48,13 @@ search the slug (the part after the `/`).
 
 ### 1B. Add Datasets as Inputs
 
-In the right sidebar click **"Add Input"**, then search and add:
+In the right sidebar click **"Add Input"**, then search and add all 5:
 
 1. `skin-cancer-mnist-ham10000` (by kmader)
 2. `aptos2019-blindness-detection` (by benjaminwarner)
-3. `brats-2021-task1` (by dschettler8845) — optional, for 3D training
+3. `brats-2021-task1` (by dschettler8845)
+4. `metastatic-tissue-classification-patchcamelyon` (by andrewmvd)
+5. `nih-chest-xrays` (by NIH — search "chest xrays nih")
 
 Each will appear as a card under "Inputs". They mount automatically under `/kaggle/input/`.
 
@@ -69,13 +73,22 @@ import os, shutil, subprocess
 # Move to / before any cleanup to avoid "getcwd" errors
 os.chdir('/')
 
-# Clean up only the old code clone (NOT /kaggle/input/ — that's your data)
+# Clean up old runs (NOT /kaggle/input/ — that's your data)
 for stale in ['/kaggle/working/MedJEPA',
               '/kaggle/working/pip_cache',
-              '/kaggle/working/tmp']:
+              '/kaggle/working/tmp',
+              '/kaggle/working/checkpoints',
+              '/kaggle/working/results']:
     if os.path.exists(stale):
         shutil.rmtree(stale, ignore_errors=True)
         print(f"cleaned {stale}")
+
+# Also remove any leftover zips/files from previous runs
+for f in os.listdir('/kaggle/working'):
+    fpath = os.path.join('/kaggle/working', f)
+    if os.path.isfile(fpath):
+        os.remove(fpath)
+        print(f"removed {fpath}")
 
 # Show free disk (should be ~16-18 GB free now)
 subprocess.run(['df', '-h', '/kaggle/working'], check=False)
@@ -93,7 +106,7 @@ print("Done!")
 
 ---
 
-**Cell 2 — Link datasets from /kaggle/input/**
+**Cell 2 — Link all 5 datasets from /kaggle/input/**
 
 ```python
 # ============================================================
@@ -109,11 +122,11 @@ os.makedirs(RAW, exist_ok=True)
 
 # Map: Kaggle input folder name → folder name our scripts expect
 DATASETS = {
-    'skin-cancer-mnist-ham10000':              'ham10000',
-    'aptos2019-blindness-detection':           'aptos2019',
-    'brats-2021-task1':                        'brats',
-    # Uncomment if you also added these:
-    # 'metastatic-tissue-classification-patchcamelyon': 'pcam',
+    'skin-cancer-mnist-ham10000':                        'ham10000',
+    'aptos2019-blindness-detection':                     'aptos2019',
+    'brats-2021-task1':                                  'brats',
+    'metastatic-tissue-classification-patchcamelyon':    'pcam',
+    'nih-chest-xrays':                                   'chestxray14',
 }
 
 for kaggle_name, our_name in DATASETS.items():
@@ -138,13 +151,13 @@ for name in sorted(os.listdir(RAW)):
 
 ---
 
-**Cell 3 — Train the model**
+**Cell 3 — Train the model (all 5 datasets)**
 
 ```python
 # ============================================================
 # CELL 3: Full training — Phase 1 (LeJEPA) + Phase 2 (V-JEPA)
 # ============================================================
-# Trains from scratch on all linked datasets.
+# Trains from scratch on all 5 linked datasets.
 # Settings tuned for T4 (16 GB VRAM):
 #   batch_size 64 + gradient_accumulation 4 = effective batch 256
 #   50 epochs ≈ 5-7 hours on T4
@@ -206,31 +219,47 @@ else:
 
 ---
 
-## Session 2 — Evaluate + Visualize (~3-4 hours)
+## Session 2 — Evaluate + Visualize (~4.5-6.5 hours)
 
 ### 2A. Create a New Notebook
 
 1. **"New Notebook"** → GPU T4, Internet ON
-2. **"Add Input"** → add the same 3 datasets as Session 1
+2. **"Add Input"** → add the same **5 datasets** as Session 1
 3. **"Add Input"** → search `medjepa-checkpoint` (your own dataset) → add it
 4. Rename to: `MedJEPA-Session2-Evaluate`
 
-### 2B. Paste These Cells
+So your Inputs sidebar should show **6 cards total** (5 datasets + 1 checkpoint).
+
+### 2B. Paste These 7 Cells
 
 ---
 
-**Cell 1 — Clone and install**
+**Cell 1 — Clone, install, and clean slate**
 
 ```python
-# Same as Session 1 Cell 1
+# ============================================================
+# CELL 1: Fresh start — clone repo and install
+# ============================================================
 import os, shutil, subprocess
 
 os.chdir('/')
+
+# Nuke everything from previous runs
 for stale in ['/kaggle/working/MedJEPA',
               '/kaggle/working/pip_cache',
-              '/kaggle/working/tmp']:
+              '/kaggle/working/tmp',
+              '/kaggle/working/checkpoints',
+              '/kaggle/working/results']:
     if os.path.exists(stale):
         shutil.rmtree(stale, ignore_errors=True)
+        print(f"cleaned {stale}")
+
+# Remove leftover files (old zips, PNGs, CSVs, etc.)
+for f in os.listdir('/kaggle/working'):
+    fpath = os.path.join('/kaggle/working', f)
+    if os.path.isfile(fpath):
+        os.remove(fpath)
+        print(f"removed {fpath}")
 
 subprocess.run(['df', '-h', '/kaggle/working'], check=False)
 
@@ -273,18 +302,23 @@ else:
 
 ---
 
-**Cell 3 — Link datasets (same as Session 1 Cell 2)**
+**Cell 3 — Link all 5 datasets**
 
 ```python
+# ============================================================
+# CELL 3: Symlink all 5 datasets from /kaggle/input/
+# ============================================================
 import os
 
 RAW = '/kaggle/working/MedJEPA/data/raw'
 os.makedirs(RAW, exist_ok=True)
 
 DATASETS = {
-    'skin-cancer-mnist-ham10000':    'ham10000',
-    'aptos2019-blindness-detection': 'aptos2019',
-    'brats-2021-task1':              'brats',
+    'skin-cancer-mnist-ham10000':                        'ham10000',
+    'aptos2019-blindness-detection':                     'aptos2019',
+    'brats-2021-task1':                                  'brats',
+    'metastatic-tissue-classification-patchcamelyon':    'pcam',
+    'nih-chest-xrays':                                   'chestxray14',
 }
 
 for kaggle_name, our_name in DATASETS.items():
@@ -294,22 +328,27 @@ for kaggle_name, our_name in DATASETS.items():
         if os.path.islink(dst):
             os.remove(dst)
         os.symlink(src, dst)
-        print(f"  linked  data/raw/{our_name}")
+        n = sum(len(f) for _, _, f in os.walk(src))
+        print(f"  linked  data/raw/{our_name}  ({n:,} files)")
     else:
-        print(f"  MISSING {kaggle_name}")
+        print(f"  MISSING {kaggle_name}  — did you add it as an Input?")
+
+print("\ndata/raw/ contents:")
+for name in sorted(os.listdir(RAW)):
+    print(f"  {name}")
 ```
 
 ---
 
-**Cell 4 — Run full evaluation**
+**Cell 4 — Run full evaluation on all 5 datasets**
 
 ```python
 # ============================================================
-# CELL 4: Run all evaluations with the corrected kNN
+# CELL 4: Evaluate on all 5 datasets
 # ============================================================
 # Skips pretraining (already done), runs:
 #   linear probe, few-shot kNN, fine-tune, segmentation
-# Takes ~2-3 hours on T4.
+# Takes ~4-6 hours on T4 with all 5 datasets.
 
 !python scripts/run_gpu_full.py \
     --skip_pretrain \
@@ -320,21 +359,27 @@ for kaggle_name, our_name in DATASETS.items():
     --results_dir results \
     --checkpoint_dir checkpoints \
     --imagenet_backbone resnet50 \
-    --ft_epochs 5
+    --ft_epochs 3
 ```
+
+> `--ft_epochs 3` instead of 5 saves ~40 min while still giving solid results.
+> If you get "CUDA out of memory" → change `--batch_size 64` to `--batch_size 32`.
 
 ---
 
 **Cell 5 — Print results**
 
 ```python
+# ============================================================
+# CELL 5: Display all results
+# ============================================================
 import json
 
 with open('results/evaluation_results.json') as f:
     results = json.load(f)
 
 print("=" * 65)
-print("RESULTS SUMMARY")
+print("RESULTS SUMMARY — 5 DATASETS")
 print("=" * 65)
 
 print("\n── Linear Probe ──────────────────────────────────────────")
@@ -365,6 +410,9 @@ for name, res in results.items():
 **Cell 6 — Generate plots**
 
 ```python
+# ============================================================
+# CELL 6: Run the analysis notebook to generate plots
+# ============================================================
 !pip install nbconvert ipykernel -q
 !python -m ipykernel install --user --name python3 2>/dev/null
 !jupyter nbconvert --execute --to notebook --inplace \
@@ -374,22 +422,41 @@ for name, res in results.items():
 
 ---
 
-**Cell 7 — Package everything**
+**Cell 7 — Package everything for download**
 
 ```python
-import shutil, os
+# ============================================================
+# CELL 7: Zip results and copy to Output tab
+# ============================================================
+import shutil, os, zipfile
 
 OUT = '/kaggle/working'
+
+# ── Copy small result files to Output root ──────────────────────
 shutil.copy('results/evaluation_results.json', f'{OUT}/evaluation_results.json')
 for f in os.listdir('results'):
     if f.endswith(('.png', '.csv')):
         shutil.copy(f'results/{f}', f'{OUT}/{f}')
 shutil.copy('notebooks/05_results_analysis.ipynb', f'{OUT}/05_results_analysis.ipynb')
-if os.path.exists('checkpoints/best_model.pt'):
-    shutil.copy('checkpoints/best_model.pt', f'{OUT}/best_model.pt')
 
-shutil.make_archive(f'{OUT}/medjepa_final', 'zip', OUT)
-print("Done! Download medjepa_final.zip from the Output tab.")
+# ── Zip only the results (small files, ~few MB) ─────────────────
+zip_path = f'{OUT}/medjepa_results.zip'
+to_zip = (
+    ['evaluation_results.json', '05_results_analysis.ipynb'] +
+    [f for f in os.listdir('results') if f.endswith(('.png', '.csv'))]
+)
+
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+    for name in to_zip:
+        src = f'{OUT}/{name}'
+        if os.path.exists(src):
+            zf.write(src, name)
+            print(f"  added {name}  ({os.path.getsize(src)/1e3:.0f} KB)")
+
+print(f"\nDone!  {os.path.getsize(zip_path)/1e6:.1f} MB")
+print("Download from the Output tab:")
+print("  • medjepa_results.zip  — all plots, CSVs, JSON, notebook")
+print("  • best_model.pt        — checkpoint (download separately)")
 ```
 
 ---
@@ -398,15 +465,20 @@ print("Done! Download medjepa_final.zip from the Output tab.")
 
 ### 1. Copy files back to your PC
 
-Extract `medjepa_final.zip` and copy into the project:
+Download two files from the **Output tab**:
+
+- `medjepa_results.zip` — results, plots, notebook
+- `best_model.pt` — checkpoint (download separately, it won't be in the zip)
+
+Extract `medjepa_results.zip` and copy into the project:
 
 ```bash
 cd f:\Projects\MedJEPA
 
-copy "C:\Users\prath\Downloads\medjepa_final\evaluation_results.json" results\evaluation_results.json
-copy "C:\Users\prath\Downloads\medjepa_final\*.png" results\
-copy "C:\Users\prath\Downloads\medjepa_final\05_results_analysis.ipynb" notebooks\05_results_analysis.ipynb
-copy "C:\Users\prath\Downloads\medjepa_final\best_model.pt" C:\Users\prath\Desktop\best_model.pt
+copy "C:\Users\prath\Downloads\medjepa_results\evaluation_results.json" results\evaluation_results.json
+copy "C:\Users\prath\Downloads\medjepa_results\*.png" results\
+copy "C:\Users\prath\Downloads\medjepa_results\05_results_analysis.ipynb" notebooks\05_results_analysis.ipynb
+copy "C:\Users\prath\Downloads\best_model.pt" C:\Users\prath\Desktop\best_model.pt
 ```
 
 ### 2. Update README few-shot table
@@ -418,7 +490,7 @@ few-shot table in `README.md` and replace the placeholder percentages.
 
 ```bash
 git add results/ notebooks/05_results_analysis.ipynb README.md
-git commit -m "Add corrected evaluation results and visualization plots"
+git commit -m "Add evaluation results across 5 medical datasets"
 git push
 ```
 
@@ -433,13 +505,14 @@ git push
 
 ## Troubleshooting
 
-### A dataset shows "MISSING" in Cell 2
+### A dataset shows "MISSING" in Cell 2 / Cell 3
 
 You forgot to add it as an Input. In the notebook sidebar:
+
 1. Click **"Add Input"**
 2. Search the slug (e.g. `skin-cancer-mnist-ham10000`)
 3. Click **"Add"**
-4. Re-run Cell 2
+4. Re-run the cell
 
 ### "CUDA out of memory"
 
@@ -474,31 +547,40 @@ import os; os.chdir('/')
 
 Then re-run Cell 1.
 
+### ChestXray14 CSV parsing is slow
+
+First time loading ChestXray14 takes ~1-2 min to parse the CSV of 112k entries.
+This is normal — subsequent accesses are fast.
+
 ---
 
 ## Time Estimate
 
-| Step | Time |
-|---|:---:|
-| Add datasets as Inputs (one-time) | 5 min |
-| **Session 1:** Cell 1 clone + install | 5 min |
-| **Session 1:** Cell 2 link datasets | <1 min |
-| **Session 1:** Cell 3 train 50 epochs | **5-7 hours** |
-| Download checkpoint, upload as dataset | 10 min |
-| **Session 2:** Cell 1-3 setup | 5 min |
-| **Session 2:** Cell 4 full evaluation | **2-3 hours** |
-| **Session 2:** Plots + package | 15 min |
-| Copy back, update README, publish release | 20 min |
-| **Total** | **~10-12 hours** |
+| Step                                      |       Time       |
+| ----------------------------------------- | :--------------: |
+| Add 5 datasets as Inputs (one-time)       |      5 min       |
+| **Session 1:** Cell 1 clone + install     |      5 min       |
+| **Session 1:** Cell 2 link 5 datasets     |      <1 min      |
+| **Session 1:** Cell 3 train 50 epochs     |  **5-7 hours**   |
+| Download checkpoint, upload as dataset    |      10 min      |
+| **Session 2:** Cell 1 clone + clean       |      5 min       |
+| **Session 2:** Cell 2 load checkpoint     |      <1 min      |
+| **Session 2:** Cell 3 link 5 datasets     |      <1 min      |
+| **Session 2:** Cell 4 full evaluation     |  **4-6 hours**   |
+| **Session 2:** Cell 5 print results       |      <1 min      |
+| **Session 2:** Cell 6 generate plots      |      10 min      |
+| **Session 2:** Cell 7 package + zip       |      2 min       |
+| Copy back, update README, publish release |      20 min      |
+| **Total**                                 | **~11-15 hours** |
 
 ---
 
 ## Checklist
 
-- [ ] HAM10000, APTOS, BraTS added as Kaggle Inputs
-- [ ] Session 1 ran, `best_model.pt` downloaded
+- [ ] All 5 datasets added as Kaggle Inputs (HAM10000, APTOS, BraTS, PCam, ChestXray14)
+- [ ] Session 1 ran with 5 datasets, `best_model.pt` downloaded
 - [ ] Checkpoint uploaded as `medjepa-checkpoint` dataset
-- [ ] Session 2 ran, `evaluation_results.json` has all metrics
+- [ ] Session 2 ran, `evaluation_results.json` has metrics for all 5 datasets
 - [ ] PNG plots generated in `results/`
 - [ ] README few-shot table updated with real numbers
 - [ ] GitHub Release `v0.1.0` has `best_model.pt` attached
