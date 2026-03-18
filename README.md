@@ -16,7 +16,9 @@
 
 </div>
 
-![MedJEPA overview](https://ucsc-ospo.github.io/project/osre26/nelbl/medjepa/featured_hud2277673f233267e86bd97a56ae7275a_569368_720x2500_fit_q75_h2_lanczos_3.webp)
+<div align="center">
+    <img src="https://ucsc-ospo.github.io/project/osre26/nelbl/medjepa/featured_hud2277673f233267e86bd97a56ae7275a_569368_720x2500_fit_q75_h2_lanczos_3.webp" alt="MedJEPA overview" />
+</div>
 
 ---
 
