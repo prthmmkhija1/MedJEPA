@@ -108,18 +108,14 @@ All experiments use ViT-B/12 architecture (768-dimensional embeddings, 12 transf
 
 ### Performance Summary
 
-<div align="center">
-<img src="results/results_table.png" alt="Performance Summary" width="750"/>
-</div>
+| Dataset                  | Linear Probe Acc (%) | AUC   | 5-shot (%) | 10-shot (%) | 20-shot (%) | Fine-tune (%) | ImageNet (%) |
+| ------------------------ | :------------------: | :---: | :--------: | :---------: | :---------: | :-----------: | :----------: |
+| HAM10000 (Skin Lesions)  |         69.3         | 0.838 |    8.9     |    29.9     |    42.3     |     71.8      |     77.3     |
+| APTOS2019 (Retinopathy)  |         64.0         | 0.733 |   22.4     |    31.4     |    44.3     |     70.0      |     78.7     |
+| PCam (Histopathology)    |         83.0         | 0.902 |   63.4     |    64.2     |    67.3     |   **89.9**    |     89.1     |
+| ChestXray14 (X-ray)      |         94.8         | 0.627 |    6.4     |     7.7     |     6.8     |     53.7      |     53.7     |
 
-### Classification Performance
-
-| Dataset                  | Linear Probe (%) | AUC   | 5-shot (%) | 10-shot (%) | 20-shot (%) | Fine-tune (%) | ImageNet (%) |
-| ------------------------ | :--------------: | :---: | :--------: | :---------: | :---------: | :-----------: | :----------: |
-| HAM10000 (Skin Lesions)  |       69.3       | 0.838 |    8.9     |    29.9     |    42.3     |     71.8      |     77.3     |
-| APTOS2019 (Retinopathy)  |       64.0       | 0.733 |   22.4     |    31.4     |    44.3     |     70.0      |     78.7     |
-| PCam (Histopathology)    |       83.0       | 0.902 |   63.4     |    64.2     |    67.3     |   **89.9**    |     89.1     |
-| ChestXray14 (X-ray)      |       94.8       | 0.627 |    6.4     |     7.7     |     6.8     |     53.7      |     53.7     |
+### Classification Results
 
 <div align="center">
 <img src="results/linear_probe_performance.png" alt="Linear Probe Performance" width="700"/>
